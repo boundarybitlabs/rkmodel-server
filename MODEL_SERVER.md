@@ -40,15 +40,16 @@ stays in `rkwhisperd`, which `rkmodel-server` reaches through
 ## Repository
 
 ```text
-rkmodel-server/            The daemon. Loads models, serves invoke over TCP.
-rkmodel-server-protocol/   Shared protocol types and framing.
+rkmodel-server/            The daemon. Loads models, serves invoke over gRPC.
+rkmodel-server-protocol/   Generated types and the tonic service stubs.
 rkmodel-server-client/     Rust client for the protocol.
 rkmodel-server-openai/     The OpenAI-compatible HTTP frontend, a client of the daemon.
-proto/                     Protocol schema.
+proto/                     Protocol schema, compiled by tonic-build.
 ```
 
 This is rkwhisper's layout: a daemon, a protocol crate, a client crate and a
-`proto/` schema.
+`proto/` schema. The protocol crate holds no hand-written codec, only the
+`tonic-build` output and the thin Rust types the client exposes over it.
 
 ## Operations and models
 
@@ -126,7 +127,10 @@ trait RkModelServer {
 }
 ```
 
-`rkmodel-server-client` implements this. Logs write the pair as
+`rkmodel-server-client` implements this over tonic. The trait is the frontend's
+only view of the daemon, so the transport stays behind it and the generated gRPC
+types never reach the HTTP layer. That also keeps the fake daemon the frontend
+tests against a plain implementation of the trait. Logs write the pair as
 `generate/qwen3-4b`.
 
 The daemon refuses a call when the model is unknown, when the model does not
@@ -142,8 +146,9 @@ forward passes.
 
 ### Types
 
-As `rkmodel-server-client` exposes them. On the wire, byte payloads travel
-separately. See [Wire](#wire).
+As `rkmodel-server-client` exposes them, which is not how they appear on the
+wire. The client maps them onto the generated proto types, and a `ByteStream`
+becomes further messages on the call rather than a field. See [Wire](#wire).
 
 ```rust
 enum Input {
@@ -213,62 +218,101 @@ model-agnostic.
 
 ### Wire
 
-Proto3 messages in frames prefixed with a little-endian `u32` length, capped at
-1 MiB. That is the framing `rkwhisper-protocol` already uses, carried over TCP
-instead of a Unix socket.
+gRPC, served by `tonic`. The schema is `proto/rkmodel.proto`, and `tonic-build`
+generates both sides from it. The three trait methods are three RPCs:
 
-- **One connection per call.** The client connects, writes one `Invoke` frame,
-  and reads frames until `Done`, `Error` or `BackOff`. There is no multiplexing,
-  and no long-lived connection to repair after a daemon restart. Connecting over
-  loopback is cheap. Pooling connections from an off-board frontend is a later
-  optimization.
-- **Byte payloads follow the `Invoke`.** Images and audio are sent as `Data
-  { blob, bytes }` frames of at most 1 MiB each, then `EndOfInput`. TCP has no
-  counterpart to the `memfd` rkwhisper passes over its Unix socket. The daemon
-  reads an image whole before running, but forwards audio to rkwhisperd as it
-  arrives, so a long recording is never held in memory whole.
-- **Closing the connection cancels the call.** A client that goes away stops
-  the work behind it. See [Cancellation](#cancellation). The client must not
-  half-close its write side after sending: `EndOfInput` marks the end of a
-  request, so EOF always means the client left.
-- **A peer that vanishes without closing**, such as a crashed host or a pulled
-  cable, is noticed by TCP keepalive, which both sides enable. During generation
-  a failed write notices sooner. Nothing is written during prefill, so there
-  keepalive is the only signal.
-- **`TCP_NODELAY`** on both sides. A token delta is a few bytes, and Nagle's
-  algorithm would hold it back.
+```protobuf
+service RkModelServer {
+  rpc Invoke(InvokeRequest) returns (InvokeResponse);
+  rpc InvokeStream(stream StreamRequest) returns (stream Event);
+  rpc Models(ModelsRequest) returns (ModelsResponse);
+}
+```
+
+- **`InvokeStream` is bidirectional**, not server-streaming. The first client
+  message carries the operation, model and input. Later messages carry audio
+  chunks, which is what `transcribe` needs, since rkwhisperd returns segments
+  while the upload is still arriving. `generate` and `embed` send one message
+  and then nothing, so the same RPC serves all three.
+- **Byte payloads are stream messages.** An image rides in the first message.
+  Audio follows as further messages, and HTTP/2 flow control provides the
+  backpressure that the hand-rolled 1 MiB `Data` frames and `EndOfInput` would
+  otherwise have to provide. The daemon reads an image whole before running, but
+  forwards audio to rkwhisperd as it arrives, so a long recording is never held
+  in memory whole. `max_decoding_message_size` is set explicitly rather than
+  left at tonic's 4 MiB default.
+- **Cancellation is the dropped handler future.** When the client goes away,
+  tonic drops the server's response stream, and a guard in that stream cancels
+  the request. There is no EOF to parse and no rule about half-closing a write
+  side. This works during prefill, when the daemon has written nothing, which is
+  the case a bare TCP connection gives no signal for. See
+  [Cancellation](#cancellation).
+- **Keepalive** is HTTP/2 `PING`, through `http2_keepalive_interval` and
+  `http2_keepalive_timeout`, so a crashed host or a pulled cable is noticed
+  without setting socket options. This covers the prefill gap as well.
+- **`TCP_NODELAY`** on both sides, via tonic's `tcp_nodelay`. A token delta is a
+  few bytes, and Nagle's algorithm would hold it back.
+- **One channel, many streams.** Calls are concurrent streams on a multiplexed
+  connection rather than a connection each. tonic's `Channel` reconnects lazily,
+  so a daemon restart needs no repair logic in the frontend.
 - **Authentication.** A Unix socket got this from file permissions. TCP does
   not. The daemon listens on loopback by default, and refuses to listen on any
-  other address without a `token_file`. The client's first frame carries the
-  token. It travels in cleartext. See the open questions.
-- **Versioning.** `Invoke` carries a protocol version. The daemon refuses a
-  version it does not speak, with an error naming both.
+  other address without a `token_file`. The client sends the token as request
+  metadata, set by an interceptor. On loopback it travels in cleartext. For
+  off-board use, tonic's rustls support supplies TLS or mutual TLS as
+  configuration rather than as a redesign.
+- **Versioning.** The proto package is `rkmodel.v1`, so the major version is in
+  every method path and a mismatched client fails at the route rather than
+  inside a handler. Requests also carry a `protocol_version` field for minor
+  revisions, and the daemon refuses a version it does not speak with an error
+  naming both.
 
-gRPC would bring streaming and cancellation too, but also HTTP/2 and code
-generation, into the process that should carry the least. Connection-per-call
-gets cancellation from the connection itself, and the framing and backoff are
-already proven in rkwhisper.
+**Why not the framing rkwhisper uses.** `rkwhisper-protocol` does frame proto3
+messages behind a little-endian `u32` length capped at 1 MiB, and reusing that
+looked like the cheaper path. Reading it, less carries over than expected. It is
+a blocking `UnixStream` rather than async, its audio never touches the socket
+because it travels through a `memfd` ring that TCP has no counterpart to, and it
+has no `prost` dependency, so its protobuf encoding and decoding are written by
+hand, field number by field number. rkmodel-server's message set is several
+times larger, covering three operations, multi-part messages, images, nine
+sampling fields and four event variants. Hand-writing that codec is the
+expensive part, and it is the part `tonic-build` removes.
+
+The cost is a build-time dependency on `protoc`, which runs on the build host
+and not on the board, and roughly seventy additional crates in a daemon that
+already links two closed-source C runtimes and holds gigabytes of weights
+resident.
 
 ### Errors
 
-| `Error` | HTTP | OpenAI `error.type` / `code` |
-| --- | --- | --- |
-| `UnknownModel` | 404 | `invalid_request_error` / `model_not_found` |
-| `UnsupportedOperation` | 400 | `invalid_request_error` |
-| `InvalidInput(msg)` | 400 | `invalid_request_error` |
-| `ContextLengthExceeded` | 400 | `invalid_request_error` / `context_length_exceeded` |
-| `Busy { retry_after_ms }` | 503, with `Retry-After` | `server_error` |
-| `Loading`, `Unavailable` | 503 | `server_error` |
-| `Runtime { call, code }` | 500 | `server_error` |
-| `Unauthorized` | 500, since it means the frontend is misconfigured | `server_error` |
-| daemon unreachable | 503 | `server_error` |
+The daemon reports failures as gRPC statuses. The frontend maps each one to an
+HTTP status and an OpenAI error body.
+
+| `Error` | gRPC `Code` | HTTP | OpenAI `error.type` / `code` |
+| --- | --- | --- | --- |
+| `UnknownModel` | `NotFound` | 404 | `invalid_request_error` / `model_not_found` |
+| `UnsupportedOperation` | `InvalidArgument` | 400 | `invalid_request_error` |
+| `InvalidInput(msg)` | `InvalidArgument` | 400 | `invalid_request_error` |
+| `ContextLengthExceeded` | `OutOfRange` | 400 | `invalid_request_error` / `context_length_exceeded` |
+| `Busy { retry_after_ms }` | `ResourceExhausted` | 503, with `Retry-After` | `server_error` |
+| `Loading`, `Unavailable` | `Unavailable` | 503 | `server_error` |
+| `Runtime { call, code }` | `Internal` | 500 | `server_error` |
+| `Unauthorized` | `Unauthenticated` | 500, since it means the frontend is misconfigured | `server_error` |
+| daemon unreachable | `Unavailable`, from the transport | 503 | `server_error` |
+| protocol version refused | `FailedPrecondition` | 500 | `server_error` |
+
+`Busy` carries its `retry_after_ms` as a `retry-after-ms` metadata entry on the
+status, which is what becomes the `Retry-After` header.
 
 Errors use OpenAI's body, `{"error": {"message", "type", "param", "code"}}`, so
 SDKs raise their usual exception types and retry the 5xx ones.
 
-Once a stream has started the status line is already sent. A mid-stream failure
-is written as a final event instead: an `error` data line for chat completions,
-`response.failed` for responses.
+A failure partway through `InvokeStream` arrives as the stream's closing status,
+so the frontend learns of it cleanly whether or not events have already flowed.
+Its own HTTP response is less forgiving: once a stream has started the status
+line is already sent, so a mid-stream failure is written as a final event
+instead, an `error` data line for chat completions and `response.failed` for
+responses.
 
 ## Inside rkmodel-server
 
@@ -375,8 +419,10 @@ to 39 with a batch of four, which is what it would buy.
 A client disconnect travels:
 
 1. The HTTP client goes away. axum drops the SSE body.
-2. The frontend drops its connection to the daemon.
-3. The daemon sees EOF on that connection and cancels the request.
+2. The frontend drops its `InvokeStream` call, which sends `RST_STREAM`.
+3. tonic drops the daemon's response stream, and the guard it holds cancels the
+   request. Nothing parses an EOF, and the frontend never has to keep a write
+   side open to stay distinguishable from a departed client.
 4. If the request is still queued, it is removed.
 5. If it is running, the next callback returns `Control::Pause`, and `run_llm`
    returns.
@@ -822,7 +868,12 @@ and pooling.
 
 ## To verify on the board
 
-Each of these is an assumption above that nothing has exercised yet.
+Each of these is an assumption above that nothing has exercised yet. The
+transport is no longer among them. A tonic spike built on an x86-64 host and run
+on the orangepi5-max confirmed the generated client and server, a bidirectional
+`InvokeStream`, status codes arriving as `NotFound` and `FailedPrecondition`,
+and cancellation firing both mid-stream and during a three-second prefill in
+which the server had written nothing.
 
 1. `set_chat_template("", "", "")` makes the runtime pass prompt text through
    unframed. If not, Plan B.
@@ -865,7 +916,7 @@ Three systemd units on the board:
 | --- | --- | --- |
 | `rkwhisperd` | rkwhisper's package | Unchanged. |
 | `rkmodel-server` | this repository | NPU device access. Restarts on failure. `Wants=` and `After=` rkwhisperd, without requiring it: transcription reports `unavailable` while rkwhisperd is down, and everything else keeps working. |
-| `rkmodel-server-openai` | this repository | No device access. Does not wait on the daemon, since it connects per request and answers 503 while the daemon is down. Can run on another host. |
+| `rkmodel-server-openai` | this repository | No device access. Does not wait on the daemon, since its `Channel` connects lazily and reconnects on its own, answering 503 while the daemon is down. Can run on another host. |
 
 - The daemon's config is `/etc/rkmodel-server.toml`, matching rkwhisper's
   `/etc/rkwhisper.toml`.
@@ -873,6 +924,10 @@ Three systemd units on the board:
   checks `Authorization: Bearer` when an API key is configured. That key is
   separate from the daemon's token.
 - Packages are built in CI as `.deb`s, as rkwhisper's are.
+- Builds need `protoc` on the build host for `tonic-build`. Nothing on the board
+  needs it. Cross-compiling from an x86-64 host with the
+  `aarch64-unknown-linux-gnu` target and `aarch64-linux-gnu-gcc` as linker
+  produces a binary that runs on the board's glibc.
 
 ## Testing
 
@@ -891,9 +946,10 @@ Three systemd units on the board:
    the frontend can run off the board and speaks one protocol. The alternative
    is the frontend using `rkwhisper-client` itself, which saves a hop for audio
    but ties the frontend to the board.
-2. **Securing TCP.** A token in cleartext is fine on loopback, and weak on a
-   shared network. Is off-board use expected soon enough to want TLS, or mutual
-   TLS, from the start?
+2. **Securing the transport.** A token in cleartext is fine on loopback, and
+   weak on a shared network. tonic makes TLS and mutual TLS configuration
+   rather than a redesign, so this is now a question of when to turn it on and
+   who issues the certificates, not whether the design can carry it.
 3. **Ports.** `7070` for the daemon and `8080` for the frontend are
    placeholders.
 4. **The first embedding model**, which picks between the RKNN and RKLLM
