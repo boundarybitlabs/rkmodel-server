@@ -875,6 +875,8 @@ The two `embed` backends:
 
 ### 1. Text generation
 
+Done. Verified against Qwen3-0.6B and MiniCPM4-0.5B on an RK3588 board.
+
 - [x] `GET /health`
 - [x] `GET /v1/models`
 - [x] `POST /v1/chat/completions`
@@ -884,11 +886,11 @@ The two `embed` backends:
   - [x] `stream: false`
   - [x] `stream: true`
   - [x] `reasoning_content`, verified against Qwen3-0.6B on the board
-- [ ] `POST /v1/responses`
-  - [ ] string input
-  - [ ] message input
-  - [ ] streaming
-  - [ ] reasoning item
+- [x] `POST /v1/responses`
+  - [x] string input
+  - [x] message input
+  - [x] streaming
+  - [x] reasoning item
 - [x] Two `generate` models configured at once, Qwen3-0.6B and MiniCPM4-0.5B,
       each rendered with its own template. Both load in parallel at startup and
       answer independently.

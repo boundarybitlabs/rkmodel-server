@@ -19,6 +19,7 @@ use tokio_stream::StreamExt;
 use crate::chat::{self, ChatRequest};
 use crate::error::ApiError;
 use crate::id;
+use crate::responses::{self, ResponsesRequest};
 
 pub struct AppState {
     pub daemon: Arc<dyn RkModelServer>,
@@ -33,7 +34,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let v1 = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/responses", post(not_yet))
+        .route("/v1/responses", post(responses_endpoint))
         .route("/v1/audio/transcriptions", post(not_yet))
         .route("/v1/embeddings", post(not_yet))
         .layer(middleware::from_fn_with_state(
@@ -213,6 +214,225 @@ async fn chat_completions(
             yield data(chat::usage_chunk_json(&id, created, &model, &usage));
         }
         yield Ok::<_, Infallible>(SseEvent::default().data("[DONE]"));
+    };
+
+    Ok(Sse::new(body).into_response())
+}
+
+/// `generate` on the named model, in the Responses API's shapes.
+///
+/// The same `GenerateInput` chat completions builds. Only the parsing and the
+/// emitted shapes differ.
+async fn responses_endpoint(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ResponsesRequest>,
+) -> Result<Response, ApiError> {
+    request.validate()?;
+
+    let model = request.model.clone();
+    let streaming = request.stream;
+    let input = Input::Generate(request.into_generate_input()?);
+
+    let ids = responses::Ids::new();
+    let created = id::now();
+
+    if !streaming {
+        let outputs = state
+            .daemon
+            .invoke(Operation::Generate, &model, vec![input])
+            .await?;
+        let Some(Output::Generated {
+            text,
+            reasoning,
+            finish,
+            usage,
+        }) = outputs.into_iter().next()
+        else {
+            return Err(ApiError::upstream("The daemon returned no generation."));
+        };
+        return Ok(Json(responses::completed_json(
+            &ids,
+            created,
+            &model,
+            &text,
+            reasoning.as_deref(),
+            finish,
+            &usage,
+        ))
+        .into_response());
+    }
+
+    let mut events = state
+        .daemon
+        .invoke_stream(Operation::Generate, &model, input)
+        .await?;
+
+    let body = async_stream::stream! {
+        let mut seq: u64 = 0;
+        // Every event carries its own type and a sequence number, and the
+        // stream ends on a terminal event rather than a [DONE] sentinel.
+        macro_rules! ev {
+            ($name:expr, $body:expr) => {{
+                let mut value = $body;
+                value["type"] = json!($name);
+                value["sequence_number"] = json!(seq);
+                seq += 1;
+                Ok::<_, Infallible>(SseEvent::default().event($name).data(value.to_string()))
+            }};
+        }
+
+        let in_progress = |ids: &responses::Ids| {
+            responses::response_json(ids, created, &model, "in_progress", vec![], None, None)
+        };
+        yield ev!("response.created", json!({"response": in_progress(&ids)}));
+        yield ev!("response.in_progress", json!({"response": in_progress(&ids)}));
+
+        let mut reasoning = String::new();
+        let mut text = String::new();
+        let mut reasoning_open = false;
+        let mut reasoning_closed = false;
+        let mut message_open = false;
+        let mut done: Option<(rkmodel_server_protocol::FinishReason, rkmodel_server_protocol::Usage)> = None;
+        let mut failed = None;
+
+        while let Some(event) = events.next().await {
+            match event {
+                Ok(Event::ReasoningDelta(delta)) => {
+                    if !reasoning_open {
+                        reasoning_open = true;
+                        yield ev!("response.output_item.added", json!({
+                            "output_index": 0,
+                            "item": responses::reasoning_item(&ids.reasoning, ""),
+                        }));
+                    }
+                    reasoning.push_str(&delta);
+                    yield ev!("response.reasoning_text.delta", json!({
+                        "item_id": ids.reasoning,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": delta,
+                    }));
+                }
+                Ok(Event::TextDelta(delta)) => {
+                    if reasoning_open && !reasoning_closed {
+                        reasoning_closed = true;
+                        yield ev!("response.reasoning_text.done", json!({
+                            "item_id": ids.reasoning,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "text": reasoning,
+                        }));
+                        yield ev!("response.output_item.done", json!({
+                            "output_index": 0,
+                            "item": responses::reasoning_item(&ids.reasoning, &reasoning),
+                        }));
+                    }
+                    let index = if reasoning_open { 1 } else { 0 };
+                    if !message_open {
+                        message_open = true;
+                        yield ev!("response.output_item.added", json!({
+                            "output_index": index,
+                            "item": responses::message_item(&ids.message, ""),
+                        }));
+                        yield ev!("response.content_part.added", json!({
+                            "item_id": ids.message,
+                            "output_index": index,
+                            "content_index": 0,
+                            "part": {"type": "output_text", "text": "", "annotations": []},
+                        }));
+                    }
+                    text.push_str(&delta);
+                    yield ev!("response.output_text.delta", json!({
+                        "item_id": ids.message,
+                        "output_index": index,
+                        "content_index": 0,
+                        "delta": delta,
+                    }));
+                }
+                Ok(Event::Done { finish, usage }) => done = Some((finish, usage)),
+                Ok(Event::Segment(_)) => {}
+                Err(e) => {
+                    failed = Some(ApiError::from(e));
+                    break;
+                }
+            }
+        }
+
+        if let Some(error) = failed {
+            yield ev!("response.failed", json!({"error": error.as_error_body()["error"]}));
+            // The counter is finished with; naming it keeps the last bump read.
+            let _ = seq;
+            return;
+        }
+
+        let Some((finish, usage)) = done else {
+            // A cancelled run ends without a final event. Nothing more is owed
+            // to a client that has already gone.
+            return;
+        };
+
+        // A run cut off while still reasoning never produced a text delta. The
+        // message item is still emitted, empty, so the streamed output matches
+        // the non-streaming body.
+        if reasoning_open && !reasoning_closed {
+            yield ev!("response.reasoning_text.done", json!({
+                "item_id": ids.reasoning,
+                "output_index": 0,
+                "content_index": 0,
+                "text": reasoning,
+            }));
+            yield ev!("response.output_item.done", json!({
+                "output_index": 0,
+                "item": responses::reasoning_item(&ids.reasoning, &reasoning),
+            }));
+        }
+        let index = if reasoning_open { 1 } else { 0 };
+        if !message_open {
+            yield ev!("response.output_item.added", json!({
+                "output_index": index,
+                "item": responses::message_item(&ids.message, ""),
+            }));
+            yield ev!("response.content_part.added", json!({
+                "item_id": ids.message,
+                "output_index": index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            }));
+        }
+
+        yield ev!("response.output_text.done", json!({
+            "item_id": ids.message,
+            "output_index": index,
+            "content_index": 0,
+            "text": text,
+        }));
+        yield ev!("response.content_part.done", json!({
+            "item_id": ids.message,
+            "output_index": index,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": text, "annotations": []},
+        }));
+        yield ev!("response.output_item.done", json!({
+            "output_index": index,
+            "item": responses::message_item(&ids.message, &text),
+        }));
+
+        let mut output = Vec::new();
+        if reasoning_open {
+            output.push(responses::reasoning_item(&ids.reasoning, &reasoning));
+        }
+        output.push(responses::message_item(&ids.message, &text));
+        let final_body = responses::response_json(
+            &ids,
+            created,
+            &model,
+            responses::status_for(finish),
+            output,
+            Some(finish),
+            Some(&usage),
+        );
+        yield ev!(responses::terminal_event(finish), json!({"response": final_body}));
+        let _ = seq;
     };
 
     Ok(Sse::new(body).into_response())
@@ -919,15 +1139,447 @@ mod tests {
         assert_eq!(body["error"]["code"], "model_not_found");
     }
 
+    // ---- responses, non-streaming -----------------------------------------
+
+    fn responses_body() -> serde_json::Value {
+        json!({"model": "qwen3-4b", "input": "why is the sky blue?"})
+    }
+
+    #[tokio::test]
+    async fn a_response_has_the_documented_shape() {
+        let mut h = harness(Fake::answering("the sky is blue", None));
+        let (status, body) = h.post("/v1/responses", responses_body()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["object"], "response");
+        assert!(body["id"].as_str().unwrap().starts_with("resp_"));
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["model"], "qwen3-4b");
+        assert_eq!(body["incomplete_details"], serde_json::Value::Null);
+
+        let output = body["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1, "no reasoning item when there was none");
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["role"], "assistant");
+        assert_eq!(output[0]["status"], "completed");
+        assert_eq!(output[0]["content"][0]["type"], "output_text");
+        assert_eq!(output[0]["content"][0]["text"], "the sky is blue");
+        assert_eq!(output[0]["content"][0]["annotations"], json!([]));
+
+        assert_eq!(body["usage"]["input_tokens"], 24);
+        assert_eq!(body["usage"]["output_tokens"], 388);
+        assert_eq!(body["usage"]["total_tokens"], 412);
+        assert_eq!(
+            body["usage"]["output_tokens_details"]["reasoning_tokens"],
+            300
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reasoning_item_leads_the_output_when_the_model_reasoned() {
+        let mut h = harness(Fake::answering("blue", Some("scattering")));
+        let (_, body) = h.post("/v1/responses", responses_body()).await;
+        let output = body["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert!(output[0]["id"].as_str().unwrap().starts_with("rs_"));
+        assert_eq!(output[0]["summary"], json!([]));
+        assert_eq!(output[0]["content"][0]["type"], "reasoning_text");
+        assert_eq!(output[0]["content"][0]["text"], "scattering");
+        assert_eq!(output[1]["type"], "message");
+        assert!(output[1]["id"].as_str().unwrap().starts_with("msg_"));
+    }
+
+    #[tokio::test]
+    async fn a_length_finish_becomes_incomplete_with_a_reason() {
+        let mut h = harness(Fake {
+            models: Some(vec![]),
+            outputs: vec![Output::Generated {
+                text: "cut off".into(),
+                reasoning: None,
+                finish: FinishReason::Length,
+                usage: Usage::default(),
+            }],
+            ..Default::default()
+        });
+        let (_, body) = h.post("/v1/responses", responses_body()).await;
+        assert_eq!(body["status"], "incomplete");
+        assert_eq!(body["incomplete_details"]["reason"], "max_output_tokens");
+    }
+
+    // ---- responses, request mapping ---------------------------------------
+
+    #[tokio::test]
+    async fn a_string_input_becomes_one_user_message() {
+        let mut h = harness(Fake::answering("x", None));
+        h.post("/v1/responses", responses_body()).await;
+        let seen = h.seen();
+        assert_eq!(seen.messages.len(), 1);
+        assert_eq!(seen.messages[0].role, rkmodel_server_protocol::Role::User);
+    }
+
+    #[tokio::test]
+    async fn instructions_become_a_system_message_placed_first() {
+        let mut h = harness(Fake::answering("x", None));
+        let mut body = responses_body();
+        body["instructions"] = json!("be brief");
+        h.post("/v1/responses", body).await;
+        let seen = h.seen();
+        assert_eq!(seen.messages[0].role, rkmodel_server_protocol::Role::System);
+        assert_eq!(seen.messages[1].role, rkmodel_server_protocol::Role::User);
+    }
+
+    #[tokio::test]
+    async fn message_items_carry_their_roles_and_parts() {
+        let mut h = harness(Fake::answering("x", None));
+        let body = json!({
+            "model": "qwen3-4b",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "first"}]},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "reply"}]},
+                {"role": "user", "content": "second"}
+            ]
+        });
+        h.post("/v1/responses", body).await;
+        let seen = h.seen();
+        assert_eq!(seen.messages.len(), 3);
+        assert_eq!(
+            seen.messages[1].role,
+            rkmodel_server_protocol::Role::Assistant
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_items_echoed_back_are_ignored() {
+        let mut h = harness(Fake::answering("x", None));
+        let body = json!({
+            "model": "qwen3-4b",
+            "input": [
+                {"type": "reasoning", "id": "rs_1", "summary": [],
+                 "content": [{"type": "reasoning_text", "text": "old thinking"}]},
+                {"type": "message", "role": "user", "content": "hi"}
+            ]
+        });
+        h.post("/v1/responses", body).await;
+        let seen = h.seen();
+        assert_eq!(seen.messages.len(), 1, "only the user turn survives");
+        assert_eq!(seen.messages[0].role, rkmodel_server_protocol::Role::User);
+    }
+
+    #[tokio::test]
+    async fn max_output_tokens_is_the_budget() {
+        let mut h = harness(Fake::answering("x", None));
+        let mut body = responses_body();
+        body["max_output_tokens"] = json!(33);
+        h.post("/v1/responses", body).await;
+        assert_eq!(h.seen().max_tokens, Some(33));
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_maps_the_same_way_as_chat() {
+        for (effort, want) in [
+            ("none", Some(false)),
+            ("minimal", Some(false)),
+            ("low", Some(true)),
+            ("high", Some(true)),
+        ] {
+            let mut h = harness(Fake::answering("x", None));
+            let mut body = responses_body();
+            body["reasoning"] = json!({"effort": effort});
+            h.post("/v1/responses", body).await;
+            assert_eq!(h.seen().reasoning, want, "effort {effort}");
+        }
+    }
+
+    // ---- responses, validation --------------------------------------------
+
+    async fn responses_refused(field: &str, patch: serde_json::Value) {
+        let mut h = harness(Fake::answering("x", None));
+        let mut body = responses_body();
+        for (k, v) in patch.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let (status, response) = h.post("/v1/responses", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"]["param"], field, "{response}");
+    }
+
+    #[tokio::test]
+    async fn continuing_a_stored_response_is_refused() {
+        responses_refused(
+            "previous_response_id",
+            json!({"previous_response_id": "resp_1"}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn responses_refuses_tools() {
+        responses_refused("tools", json!({"tools": [{"type": "function"}]})).await;
+        responses_refused("tool_choice", json!({"tool_choice": "auto"})).await;
+    }
+
+    #[tokio::test]
+    async fn a_structured_text_format_is_refused() {
+        responses_refused(
+            "text.format",
+            json!({"text": {"format": {"type": "json_schema"}}}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_plain_text_format_is_allowed() {
+        let mut h = harness(Fake::answering("x", None));
+        let mut body = responses_body();
+        body["text"] = json!({"format": {"type": "text"}});
+        let (status, _) = h.post("/v1/responses", body).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_image_part_is_refused_until_milestone_three() {
+        responses_refused(
+            "input",
+            json!({"input": [{"role": "user", "content": [
+                {"type": "input_image", "image_url": "data:image/png;base64,AA"}]}]}),
+        )
+        .await;
+    }
+
+    // ---- responses, streaming ---------------------------------------------
+
+    /// Event names in order, from the `event:` lines.
+    fn sse_events(body: &str) -> Vec<String> {
+        body.split("\n\n")
+            .filter_map(|block| {
+                block
+                    .lines()
+                    .find(|l| l.starts_with("event:"))
+                    .map(|l| l.trim_start_matches("event:").trim().to_string())
+            })
+            .collect()
+    }
+
+    fn streaming_responses_body() -> serde_json::Value {
+        let mut body = responses_body();
+        body["stream"] = json!(true);
+        body
+    }
+
+    #[tokio::test]
+    async fn a_text_only_stream_follows_the_documented_event_order() {
+        let mut h = harness(Fake::streaming(vec![
+            Ok(Event::TextDelta("the sky ".into())),
+            Ok(Event::TextDelta("is blue".into())),
+            Ok(Event::Done {
+                finish: FinishReason::Stop,
+                usage: Usage::default(),
+            }),
+        ]));
+        let (status, body) = h
+            .post_raw("/v1/responses", streaming_responses_body())
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            sse_events(&body),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ],
+            "{body}"
+        );
+        assert!(!body.contains("[DONE]"), "responses has no DONE sentinel");
+    }
+
+    #[tokio::test]
+    async fn a_reasoning_stream_brackets_the_reasoning_item_first() {
+        let mut h = harness(Fake::streaming(vec![
+            Ok(Event::ReasoningDelta("hmm".into())),
+            Ok(Event::TextDelta("blue".into())),
+            Ok(Event::Done {
+                finish: FinishReason::Stop,
+                usage: Usage::default(),
+            }),
+        ]));
+        let (_, body) = h
+            .post_raw("/v1/responses", streaming_responses_body())
+            .await;
+        assert_eq!(
+            sse_events(&body),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ],
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_numbers_count_up_from_zero() {
+        let mut h = harness(Fake::streaming(vec![
+            Ok(Event::TextDelta("a".into())),
+            Ok(Event::Done {
+                finish: FinishReason::Stop,
+                usage: Usage::default(),
+            }),
+        ]));
+        let (_, body) = h
+            .post_raw("/v1/responses", streaming_responses_body())
+            .await;
+        let numbers: Vec<u64> = sse_data(&body)
+            .iter()
+            .filter_map(|v| v.get("sequence_number").and_then(|n| n.as_u64()))
+            .collect();
+        assert!(!numbers.is_empty());
+        assert_eq!(
+            numbers,
+            (0..numbers.len() as u64).collect::<Vec<_>>(),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reasoning_item_sits_at_output_index_zero_and_the_message_after_it() {
+        let mut h = harness(Fake::streaming(vec![
+            Ok(Event::ReasoningDelta("hmm".into())),
+            Ok(Event::TextDelta("blue".into())),
+            Ok(Event::Done {
+                finish: FinishReason::Stop,
+                usage: Usage::default(),
+            }),
+        ]));
+        let (_, body) = h
+            .post_raw("/v1/responses", streaming_responses_body())
+            .await;
+        let data = sse_data(&body);
+        let reasoning_delta = data
+            .iter()
+            .find(|v| v["type"] == "response.reasoning_text.delta")
+            .unwrap();
+        let text_delta = data
+            .iter()
+            .find(|v| v["type"] == "response.output_text.delta")
+            .unwrap();
+        assert_eq!(reasoning_delta["output_index"], 0);
+        assert_eq!(text_delta["output_index"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_budget_cut_off_stream_ends_incomplete() {
+        let mut h = harness(Fake::streaming(vec![
+            Ok(Event::TextDelta("cut".into())),
+            Ok(Event::Done {
+                finish: FinishReason::Length,
+                usage: Usage::default(),
+            }),
+        ]));
+        let (_, body) = h
+            .post_raw("/v1/responses", streaming_responses_body())
+            .await;
+        let events = sse_events(&body);
+        assert_eq!(events.last().unwrap(), "response.incomplete", "{body}");
+        let last = sse_data(&body).pop().unwrap();
+        assert_eq!(last["response"]["status"], "incomplete");
+        assert_eq!(
+            last["response"]["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_cut_off_while_still_reasoning_still_emits_an_empty_message() {
+        // Matches the non-streaming body, which always carries a message item.
+        let mut h = harness(Fake::streaming(vec![
+            Ok(Event::ReasoningDelta("still thinking".into())),
+            Ok(Event::Done {
+                finish: FinishReason::Length,
+                usage: Usage::default(),
+            }),
+        ]));
+        let (_, body) = h
+            .post_raw("/v1/responses", streaming_responses_body())
+            .await;
+        let last = sse_data(&body).pop().unwrap();
+        let output = last["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2, "{body}");
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "");
+    }
+
+    #[tokio::test]
+    async fn a_failure_partway_through_becomes_response_failed() {
+        let mut h = harness(Fake::streaming(vec![
+            Ok(Event::TextDelta("the sky ".into())),
+            Err(Error::Runtime {
+                call: "run_llm".into(),
+                code: -1,
+            }),
+        ]));
+        let (status, body) = h
+            .post_raw("/v1/responses", streaming_responses_body())
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            sse_events(&body).last().unwrap(),
+            "response.failed",
+            "{body}"
+        );
+        let last = sse_data(&body).pop().unwrap();
+        assert_eq!(last["error"]["type"], "server_error");
+    }
+
+    #[tokio::test]
+    async fn the_final_response_carries_the_whole_text_and_usage() {
+        let mut h = harness(Fake::streaming(vec![
+            Ok(Event::TextDelta("the sky ".into())),
+            Ok(Event::TextDelta("is blue".into())),
+            Ok(Event::Done {
+                finish: FinishReason::Stop,
+                usage: Usage {
+                    input_tokens: 24,
+                    output_tokens: 2,
+                    reasoning_tokens: 0,
+                },
+            }),
+        ]));
+        let (_, body) = h
+            .post_raw("/v1/responses", streaming_responses_body())
+            .await;
+        let last = sse_data(&body).pop().unwrap();
+        assert_eq!(last["response"]["status"], "completed");
+        assert_eq!(
+            last["response"]["output"][0]["content"][0]["text"],
+            "the sky is blue"
+        );
+        assert_eq!(last["response"]["usage"]["total_tokens"], 26);
+    }
+
     // ---- still unimplemented ----------------------------------------------
 
     #[tokio::test]
     async fn the_other_endpoints_still_answer_501() {
-        for uri in [
-            "/v1/responses",
-            "/v1/audio/transcriptions",
-            "/v1/embeddings",
-        ] {
+        for uri in ["/v1/audio/transcriptions", "/v1/embeddings"] {
             let mut h = harness(Fake::answering("x", None));
             let (status, _) = h.post(uri, json!({})).await;
             assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{uri}");

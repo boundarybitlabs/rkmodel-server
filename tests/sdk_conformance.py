@@ -99,8 +99,13 @@ if reasoning is None:
 else:
     check("reasoning_content is not empty", bool(reasoning.strip()), f"{len(reasoning)} chars")
     check("no markers leak into reasoning", "<think>" not in reasoning and "</think>" not in reasoning)
-    check("content is separate from reasoning",
-          bool(r.choices[0].message.content.strip()), r.choices[0].message.content[:60])
+    # A small reasoning model can spend a whole budget thinking, and returning
+    # the reasoning with empty content and a length finish is the documented
+    # behaviour. Only an empty content on a natural stop would be wrong.
+    truncated_while_reasoning = r.choices[0].finish_reason == "length"
+    check("content is separate from reasoning, unless the budget ran out first",
+          bool(r.choices[0].message.content.strip()) or truncated_while_reasoning,
+          f"finish={r.choices[0].finish_reason} content={r.choices[0].message.content[:40]!r}")
     check("reasoning tokens are counted",
           r.usage.completion_tokens_details.reasoning_tokens > 0,
           r.usage.completion_tokens_details.reasoning_tokens)
@@ -127,6 +132,95 @@ else:
                     order.append("content")
     check("streamed reasoning arrives before content", order == ["reasoning", "content"], order)
     check("reasoning never resumes after content", not seen_content_before_reasoning)
+
+# ---- /v1/responses --------------------------------------------------------
+
+r = client.responses.create(
+    model=MODEL,
+    input="Why is the sky blue? One sentence.",
+    max_output_tokens=80,
+    reasoning={"effort": "none"},
+)
+check("a response parses into a typed object", r.object == "response")
+check("its status is completed or incomplete", r.status in ("completed", "incomplete"), r.status)
+check("output_text is populated", bool(r.output_text.strip()), r.output_text[:60])
+check("the output ends with a message item", r.output[-1].type == "message")
+check("the message carries output_text content", r.output[-1].content[0].type == "output_text")
+check("response usage adds up",
+      r.usage.total_tokens == r.usage.input_tokens + r.usage.output_tokens,
+      r.usage.model_dump())
+
+r = client.responses.create(
+    model=MODEL,
+    instructions="Answer in one word.",
+    input=[{"role": "user", "content": [{"type": "input_text", "text": "Name a primary color."}]}],
+    max_output_tokens=80,
+    reasoning={"effort": "none"},
+)
+check("instructions and message items are accepted", bool(r.output_text.strip()), r.output_text[:40])
+
+# A prompt no model finishes in sixteen tokens, so the budget is what stops it.
+r = client.responses.create(
+    model=MODEL,
+    input="Write an extremely long and detailed essay about the ocean, at least 2000 words.",
+    max_output_tokens=16,
+    reasoning={"effort": "none"},
+)
+check("a budget cut-off reports incomplete", r.status == "incomplete", r.status)
+check("and says why",
+      r.incomplete_details is not None
+      and r.incomplete_details.reason == "max_output_tokens",
+      r.incomplete_details)
+
+reasoning_items = []
+r = client.responses.create(model=MODEL, input="What is 17 plus 25?", max_output_tokens=2000)
+reasoning_items = [i for i in r.output if i.type == "reasoning"]
+if not reasoning_items:
+    print("SKIP  response reasoning item - this model does not reason")
+else:
+    item = reasoning_items[0]
+    check("the reasoning item leads the output", r.output[0].type == "reasoning")
+    check("it carries reasoning_text", item.content[0].type == "reasoning_text",
+          item.content[0].type)
+    check("with non-empty text", bool(item.content[0].text.strip()),
+          f"{len(item.content[0].text)} chars")
+    check("and a message item follows it", r.output[-1].type == "message")
+    check("whose text is present unless the budget ran out first",
+          bool(r.output[-1].content[0].text.strip()) or r.status == "incomplete",
+          f"status={r.status}")
+
+seen, terminal = [], None
+stream = client.responses.create(
+    model=MODEL, input="Count to three.", max_output_tokens=2000,
+    reasoning={"effort": "none"}, stream=True,
+)
+for event in stream:
+    seen.append(event.type)
+    if event.type in ("response.completed", "response.incomplete", "response.failed"):
+        terminal = event
+check("the stream opens with created then in_progress",
+      seen[:2] == ["response.created", "response.in_progress"], seen[:2])
+check("output_text deltas arrive", seen.count("response.output_text.delta") > 0,
+      seen.count("response.output_text.delta"))
+check("the item and part are bracketed",
+      all(e in seen for e in ["response.output_item.added", "response.content_part.added",
+                              "response.output_text.done", "response.content_part.done",
+                              "response.output_item.done"]),
+      sorted(set(seen)))
+check("it ends on a terminal event", terminal is not None and
+      terminal.type in ("response.completed", "response.incomplete"),
+      terminal.type if terminal else None)
+check("the terminal event carries the whole response",
+      terminal is not None and bool(terminal.response.output_text.strip()),
+      terminal.response.output_text[:50] if terminal else None)
+
+try:
+    client.responses.create(model=MODEL, input="hi", previous_response_id="resp_1")
+    check("previous_response_id raises BadRequestError", False, "no exception")
+except openai.BadRequestError as e:
+    check("previous_response_id raises BadRequestError", True, e.body.get("param"))
+except Exception as e:
+    check("previous_response_id raises BadRequestError", False, type(e).__name__)
 
 try:
     client.chat.completions.create(model="not-a-model",

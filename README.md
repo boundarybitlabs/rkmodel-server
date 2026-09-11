@@ -9,8 +9,10 @@ there.
 
 ## State
 
-Text generation works end to end on an RK3588 board, streaming and not, and the
-official `openai` Python SDK passes against it. `/v1/responses`,
+Text generation works end to end on an RK3588 board. Both
+`/v1/chat/completions` and `/v1/responses` are served, streaming and not, with
+reasoning split into its own field. The official `openai` Python SDK passes
+against both, on a reasoning model and one that does not reason.
 `/v1/audio/transcriptions` and `/v1/embeddings` answer 501 until their
 milestones land.
 

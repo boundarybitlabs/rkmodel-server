@@ -4,6 +4,7 @@
 mod chat;
 mod error;
 mod id;
+mod responses;
 mod routes;
 
 use std::net::SocketAddr;
