@@ -859,13 +859,14 @@ The two `embed` backends:
 
 - [x] `GET /health`
 - [x] `GET /v1/models`
-- [ ] `POST /v1/chat/completions`
-  - [ ] `system`, `user` and `assistant` messages
-  - [ ] `temperature`
-  - [ ] `max_tokens`
-  - [ ] `stream: false`
-  - [ ] `stream: true`
-  - [ ] `reasoning_content`
+- [x] `POST /v1/chat/completions`
+  - [x] `system`, `user` and `assistant` messages
+  - [x] `temperature`
+  - [x] `max_tokens`
+  - [x] `stream: false`
+  - [x] `stream: true`
+  - [x] `reasoning_content`, implemented and covered by tests, though no
+        reasoning model has been configured on the board yet
 - [ ] `POST /v1/responses`
   - [ ] string input
   - [ ] message input
@@ -873,9 +874,13 @@ The two `embed` backends:
   - [ ] reasoning item
 - [ ] Two `generate` models configured at once, such as Qwen3 and MiniCPM4, each
       rendered with its own template.
-- [ ] Client disconnect stops generation.
-- [ ] A full queue answers 503 with `Retry-After`.
-- [ ] The official `openai` Python SDK passes against it, streaming and not.
+- [x] Client disconnect stops generation. Measured on the board: a streaming
+      request killed one second in stopped at 19 tokens of a 250 budget, and the
+      daemon served the next request normally.
+- [x] A full queue answers 503 with `Retry-After`. Six concurrent requests
+      against a queue of one were served twice and refused four times.
+- [x] The official `openai` Python SDK passes against it, streaming and not.
+      `tests/sdk_conformance.py` is that check.
 - [ ] Every item under [To verify on the board](#to-verify-on-the-board) that
       text generation depends on.
 

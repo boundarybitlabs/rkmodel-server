@@ -904,9 +904,11 @@ name = "rkmodel-server-openai"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum",
  "clap",
+ "futures-core",
  "rkmodel-server-client",
  "rkmodel-server-protocol",
  "serde",
