@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+# A new push supersedes whatever is still running for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # .cargo/config.toml points the aarch64 target at a cross linker, which is
+  # right when building for the board from an x86_64 host. On the arm64 runners
+  # below that triple is the host, so the native linker is the correct one.
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: cc
+
+jobs:
+  rust:
+    name: Rust
+    # arm64, so the binaries this builds are the ones the board runs. The NPU
+    # runtime is resolved by dlopen at run time, so nothing here needs it.
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc
+        # tonic-build compiles proto/rkmodel.proto at build time. Only the build
+        # host needs this; the board never does.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+
+      - name: Cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Cargo test
+        # Everything above the backend seam. The rkllm backend itself needs an
+        # RK3588, and is covered by tests/sdk_conformance.py against a board.
+        run: cargo test --workspace --all-targets
+
+  frontend-portability:
+    name: Frontend on x86_64
+    # The frontend needs no hardware and is meant to build and test anywhere,
+    # including off the board. This job is what keeps that true.
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Test the frontend against its fake daemon
+        run: cargo test -p rkmodel-server-openai --all-targets
+
+  binaries:
+    name: Release binaries
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Build
+        run: cargo build --workspace --release
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: rkmodel-server-aarch64
+          path: |
+            target/release/rkmodel-server
+            target/release/rkmodel-server-openai
+          if-no-files-found: error
