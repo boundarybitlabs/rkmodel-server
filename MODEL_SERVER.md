@@ -525,6 +525,12 @@ keeps each model's defaults from its config, which are also the values given to
 `Param` at load, and lays the request's fields over them. A request with no
 sampling fields sets no override at all.
 
+Every one of the nine has a default, so a model whose config names none or only
+some still has a complete set. Those defaults are the daemon's own rather than a
+reading of the runtime's, which resolves its defaults at init and exposes only
+`n_batch`. Passing the same set to `Param` at load is what keeps the daemon's
+copy and the runtime's active settings in step.
+
 - `temperature = 0` becomes `top_k = 1`, rather than trusting the runtime with
   a zero divisor.
 - `max_tokens` becomes `InferParams::max_new_tokens`, clamped to the model's

@@ -57,7 +57,8 @@ pub struct ModelConfig {
     pub reasoning: Option<Reasoning>,
     pub max_context_len: Option<u32>,
     pub max_new_tokens: Option<u32>,
-    pub sampling: Option<Sampling>,
+    #[serde(default)]
+    pub sampling: Sampling,
     pub vision: Option<Vision>,
 
     // rknn
@@ -103,18 +104,68 @@ pub struct Vision {
 /// All nine, because `InferParams::sampling` takes a whole `Sampling` rather
 /// than a partial override. A per-run change to one field needs the other
 /// eight, so they are kept here and the request's fields are laid over them.
-#[derive(Debug, Clone, Copy, Deserialize)]
+///
+/// Every field defaults, so a model always has a complete set even when the
+/// config names none or only some. These values are the daemon's own, not a
+/// reading of the runtime's: the runtime resolves its defaults at init and
+/// exposes only `n_batch`. The daemon passes this same set to `Param` at load,
+/// which is what keeps the two in step.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sampling {
+    #[serde(default = "d_temperature")]
     pub temperature: f32,
+    #[serde(default = "d_top_p")]
     pub top_p: f32,
+    #[serde(default = "d_top_k")]
     pub top_k: u32,
+    #[serde(default = "d_repeat_penalty")]
     pub repeat_penalty: f32,
+    #[serde(default)]
     pub frequency_penalty: f32,
+    #[serde(default)]
     pub presence_penalty: f32,
+    #[serde(default)]
     pub mirostat: u32,
+    #[serde(default = "d_mirostat_tau")]
     pub mirostat_tau: f32,
+    #[serde(default = "d_mirostat_eta")]
     pub mirostat_eta: f32,
+}
+
+fn d_temperature() -> f32 {
+    0.8
+}
+fn d_top_p() -> f32 {
+    0.9
+}
+fn d_top_k() -> u32 {
+    40
+}
+fn d_repeat_penalty() -> f32 {
+    1.1
+}
+fn d_mirostat_tau() -> f32 {
+    5.0
+}
+fn d_mirostat_eta() -> f32 {
+    0.1
+}
+
+impl Default for Sampling {
+    fn default() -> Sampling {
+        Sampling {
+            temperature: d_temperature(),
+            top_p: d_top_p(),
+            top_k: d_top_k(),
+            repeat_penalty: d_repeat_penalty(),
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            mirostat: 0,
+            mirostat_tau: d_mirostat_tau(),
+            mirostat_eta: d_mirostat_eta(),
+        }
+    }
 }
 
 impl ModelConfig {
@@ -290,6 +341,38 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("rkwhisper_socket"), "{err}");
+    }
+
+    #[test]
+    fn a_model_with_no_sampling_block_still_gets_all_nine() {
+        let c = parse(
+            r#"
+            [[models]]
+            id = "a"
+            operations = ["generate"]
+            backend = "rkllm"
+            rkllm = "/x.rkllm"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.models[0].sampling, Sampling::default());
+    }
+
+    #[test]
+    fn a_partial_sampling_block_defaults_the_rest() {
+        let c = parse(
+            r#"
+            [[models]]
+            id = "a"
+            operations = ["generate"]
+            backend = "rkllm"
+            rkllm = "/x.rkllm"
+            sampling = { temperature = 0.2 }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.models[0].sampling.temperature, 0.2);
+        assert_eq!(c.models[0].sampling.top_k, Sampling::default().top_k);
     }
 
     #[test]
