@@ -883,22 +883,23 @@ The two `embed` backends:
   - [x] `max_tokens`
   - [x] `stream: false`
   - [x] `stream: true`
-  - [x] `reasoning_content`, implemented and covered by tests, though no
-        reasoning model has been configured on the board yet
+  - [x] `reasoning_content`, verified against Qwen3-0.6B on the board
 - [ ] `POST /v1/responses`
   - [ ] string input
   - [ ] message input
   - [ ] streaming
   - [ ] reasoning item
-- [ ] Two `generate` models configured at once, such as Qwen3 and MiniCPM4, each
-      rendered with its own template.
+- [x] Two `generate` models configured at once, Qwen3-0.6B and MiniCPM4-0.5B,
+      each rendered with its own template. Both load in parallel at startup and
+      answer independently.
 - [x] Client disconnect stops generation. Measured on the board: a streaming
       request killed one second in stopped at 19 tokens of a 250 budget, and the
       daemon served the next request normally.
 - [x] A full queue answers 503 with `Retry-After`. Six concurrent requests
       against a queue of one were served twice and refused four times.
 - [x] The official `openai` Python SDK passes against it, streaming and not.
-      `tests/sdk_conformance.py` is that check.
+      `tests/sdk_conformance.py` is that check, and it passes against both a
+      reasoning model and one that does not reason.
 - [ ] Every item under [To verify on the board](#to-verify-on-the-board) that
       text generation depends on.
 

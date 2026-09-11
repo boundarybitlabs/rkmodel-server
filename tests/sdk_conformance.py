@@ -37,10 +37,15 @@ models = client.models.list()
 check("models.list returns the model", any(m.id == MODEL for m in models.data),
       [m.id for m in models.data])
 
+# Reasoning is turned off for the content checks. A reasoning model given a
+# small budget spends all of it thinking and returns empty content, which is
+# correct behaviour but tells us nothing about the content path. Models that do
+# not reason ignore the field.
 r = client.chat.completions.create(
     model=MODEL,
     messages=[{"role": "user", "content": "Why is the sky blue? One sentence."}],
-    max_tokens=40,
+    max_tokens=60,
+    reasoning_effort="none",
 )
 check("non-streaming parses into a typed object", r.object == "chat.completion")
 check("it has one choice", len(r.choices) == 1)
@@ -53,9 +58,10 @@ check("usage adds up", r.usage.total_tokens == r.usage.prompt_tokens + r.usage.c
 stream = client.chat.completions.create(
     model=MODEL,
     messages=[{"role": "user", "content": "Count to three."}],
-    max_tokens=25,
+    max_tokens=60,
     stream=True,
     stream_options={"include_usage": True},
+    reasoning_effort="none",
 )
 chunks, text, usage, finish = [], "", None, None
 for chunk in stream:
@@ -75,6 +81,52 @@ check("a finish_reason arrived", finish in ("stop", "length"), finish)
 check("the usage chunk arrived", usage is not None and usage.total_tokens > 0,
       usage.model_dump() if usage else None)
 check("every chunk shares one id", len({c.id for c in chunks}) == 1)
+
+# Reasoning, when the model does. reasoning_content is not a field the SDK
+# knows, so it arrives in model_extra.
+def reasoning_of(message):
+    return (message.model_extra or {}).get("reasoning_content")
+
+
+r = client.chat.completions.create(
+    model=MODEL,
+    messages=[{"role": "user", "content": "What is 17 plus 25?"}],
+    max_tokens=2000,
+)
+reasoning = reasoning_of(r.choices[0].message)
+if reasoning is None:
+    print("SKIP  reasoning checks - this model does not reason")
+else:
+    check("reasoning_content is not empty", bool(reasoning.strip()), f"{len(reasoning)} chars")
+    check("no markers leak into reasoning", "<think>" not in reasoning and "</think>" not in reasoning)
+    check("content is separate from reasoning",
+          bool(r.choices[0].message.content.strip()), r.choices[0].message.content[:60])
+    check("reasoning tokens are counted",
+          r.usage.completion_tokens_details.reasoning_tokens > 0,
+          r.usage.completion_tokens_details.reasoning_tokens)
+    check("reasoning tokens are part of the completion total",
+          r.usage.completion_tokens_details.reasoning_tokens <= r.usage.completion_tokens)
+
+    order, seen_content_before_reasoning = [], False
+    stream = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": "What is 2 plus 2?"}],
+        max_tokens=2000,
+        stream=True,
+    )
+    for chunk in stream:
+        for choice in chunk.choices:
+            extra = choice.delta.model_extra or {}
+            if extra.get("reasoning_content"):
+                if "content" in order:
+                    seen_content_before_reasoning = True
+                if "reasoning" not in order:
+                    order.append("reasoning")
+            elif choice.delta.content:
+                if "content" not in order:
+                    order.append("content")
+    check("streamed reasoning arrives before content", order == ["reasoning", "content"], order)
+    check("reasoning never resumes after content", not seen_content_before_reasoning)
 
 try:
     client.chat.completions.create(model="not-a-model",
