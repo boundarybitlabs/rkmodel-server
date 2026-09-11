@@ -1,0 +1,51 @@
+# The daemon's config, and the single source of truth for which models exist.
+# Installed at /etc/rkmodel-server.toml. The model ids and paths below are
+# illustrative; no embedding model has been chosen yet.
+
+listen = "127.0.0.1:7070"
+# Required when `listen` is not a loopback address.
+# token_file = "/etc/rkmodel-server/token"
+rkwhisper_socket = "/run/rkwhisper/asr.sock"
+
+[[models]]
+id = "qwen3-4b"
+operations = ["generate"]
+backend = "rkllm"
+rkllm = "/models/qwen3-4b/qwen3-4b-w8a8.rkllm"
+chat_template = "/models/qwen3-4b/tokenizer_config.json"
+reasoning = { start = "<think>", end = "</think>", default = false }
+max_context_len = 4096
+max_new_tokens = 1024
+queue_depth = 8
+# All nine, because a per-run override replaces all nine.
+sampling = { temperature = 0.7, top_p = 0.8, top_k = 20, repeat_penalty = 1.0, frequency_penalty = 0.0, presence_penalty = 0.0, mirostat = 0, mirostat_tau = 5.0, mirostat_eta = 0.1 }
+
+[[models]]
+id = "minicpm4-0.5b"
+operations = ["generate"]
+backend = "rkllm"
+rkllm = "/models/minicpm4-0.5b/minicpm4-0.5b-w8a8_g128.rkllm"
+chat_template = "/models/minicpm4-0.5b/tokenizer_config.json"
+
+[[models]]
+id = "qwen3-vl-2b"
+operations = ["generate"]
+backend = "rkllm"
+rkllm = "/models/qwen3-vl-2b/language.rkllm"
+vision = { rknn = "/models/qwen3-vl-2b/vision.rknn", core_mask = [0] }
+chat_template = "/models/qwen3-vl-2b/chat_template.jinja"
+
+[[models]]
+id = "bge-small-en-v1.5"
+operations = ["embed"]
+backend = "rknn"
+rknn = "/models/bge-small-en-v1.5/model.rknn"
+tokenizer = "/models/bge-small-en-v1.5/tokenizer.json"
+pooling = "cls"
+normalize = true
+core_mask = [0]
+
+[[models]]
+id = "whisper-small-30s"
+operations = ["transcribe"]
+backend = "rkwhisper"

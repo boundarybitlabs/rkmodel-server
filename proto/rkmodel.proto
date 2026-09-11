@@ -1,0 +1,94 @@
+syntax = "proto3";
+package rkmodel.v1;
+
+enum Operation {
+  OPERATION_UNSPECIFIED = 0;
+  OPERATION_GENERATE    = 1;
+  OPERATION_EMBED       = 2;
+  OPERATION_TRANSCRIBE  = 3;
+}
+
+enum Role { ROLE_UNSPECIFIED = 0; ROLE_SYSTEM = 1; ROLE_USER = 2; ROLE_ASSISTANT = 3; }
+
+message Image { uint32 width = 1; uint32 height = 2; bytes rgb8 = 3; }
+message Part { oneof part { string text = 1; Image image = 2; } }
+message Message { Role role = 1; repeated Part parts = 2; }
+
+message GenerateInput {
+  repeated Message messages = 1;
+  optional float temperature = 2;
+  optional float top_p = 3;
+  optional uint32 max_tokens = 4;
+  optional bool reasoning = 5;
+}
+message EmbedInput { string text = 1; }
+message TranscribeInput { bytes pcm_s16le = 1; optional string language = 2; }
+
+message Input {
+  oneof input {
+    GenerateInput generate = 1;
+    EmbedInput embed = 2;
+    TranscribeInput transcribe = 3;
+  }
+}
+
+message InvokeRequest {
+  uint32 protocol_version = 1;
+  Operation operation = 2;
+  string model = 3;
+  repeated Input inputs = 4;
+}
+
+enum FinishReason { FINISH_REASON_UNSPECIFIED = 0; FINISH_REASON_STOP = 1; FINISH_REASON_LENGTH = 2; }
+message Usage { uint32 input_tokens = 1; uint32 output_tokens = 2; uint32 reasoning_tokens = 3; }
+message Segment { string text = 1; float start_s = 2; float end_s = 3; }
+
+message Generated { string text = 1; optional string reasoning = 2; FinishReason finish = 3; Usage usage = 4; }
+message Embedding { repeated float vector = 1; uint32 tokens = 2; }
+message Transcript { string text = 1; repeated Segment segments = 2; float audio_s = 3; }
+
+message Output { oneof output { Generated generated = 1; Embedding embedding = 2; Transcript transcript = 3; } }
+message InvokeResponse { repeated Output outputs = 1; }
+
+message Done { FinishReason finish = 1; Usage usage = 2; }
+message Event {
+  oneof event {
+    string reasoning_delta = 1;
+    string text_delta = 2;
+    Segment segment = 3;
+    Done done = 4;
+  }
+}
+
+message StreamRequest {
+  uint32 protocol_version = 1;
+  Operation operation = 2;
+  string model = 3;
+  Input input = 4;
+}
+
+enum ModelState {
+  MODEL_STATE_UNSPECIFIED = 0;
+  MODEL_STATE_LOADING = 1;
+  MODEL_STATE_READY = 2;
+  MODEL_STATE_FAILED = 3;
+  MODEL_STATE_UNAVAILABLE = 4;
+}
+message ImageInputSize { uint32 width = 1; uint32 height = 2; }
+message ModelInfo {
+  string id = 1;
+  repeated Operation operations = 2;
+  ModelState state = 3;
+  string failure = 4;
+  uint64 loaded_at = 5;
+  optional ImageInputSize image_input = 6;
+  bool reasoning = 7;
+}
+message ModelsRequest {}
+message ModelsResponse { repeated ModelInfo models = 1; }
+
+service RkModelServer {
+  rpc Invoke(InvokeRequest) returns (InvokeResponse);
+  rpc InvokeStream(stream StreamRequest) returns (stream Event);
+  rpc Models(ModelsRequest) returns (ModelsResponse);
+}

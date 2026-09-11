@@ -1,7 +1,9 @@
 # rkmodel-server
 
-Design draft. Nothing here is built yet. This file moves to the `rkmodel-server`
-repository once that exists.
+The design, and the plan of record. The workspace now exists as a skeleton: the
+protocol, the client, the daemon's config and validation, and the two endpoints
+that need no model worker. Nothing loads weights yet, so no model reports ready.
+[Milestones](#milestones) tracks the rest.
 
 `rkmodel-server` runs models on a Rockchip NPU and serves them over TCP.
 `rkmodel-server-openai` puts an OpenAI-compatible HTTP API in front of it, so an
@@ -830,8 +832,8 @@ The two `embed` backends:
 
 ### 1. Text generation
 
-- [ ] `GET /health`
-- [ ] `GET /v1/models`
+- [x] `GET /health`
+- [x] `GET /v1/models`
 - [ ] `POST /v1/chat/completions`
   - [ ] `system`, `user` and `assistant` messages
   - [ ] `temperature`

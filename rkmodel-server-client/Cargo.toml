@@ -1,0 +1,16 @@
+[package]
+name = "rkmodel-server-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust client for rkmodel-server."
+
+[dependencies]
+rkmodel-server-protocol.workspace = true
+tonic.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+async-stream.workspace = true
+futures-core.workspace = true
+async-trait = "0.1"
+tracing.workspace = true

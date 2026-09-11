@@ -1,0 +1,63 @@
+# rkmodel-server
+
+Runs models on a Rockchip NPU and serves them over gRPC.
+`rkmodel-server-openai` puts an OpenAI-compatible HTTP API in front of it, so an
+existing OpenAI client works by changing its base URL and model name.
+
+[MODEL_SERVER.md](MODEL_SERVER.md) is the design and the plan of record. Start
+there.
+
+## State
+
+A skeleton. The protocol, the client, the daemon's config and validation, and
+the endpoints that need no model worker are in place and tested. Nothing loads
+weights yet, so `/health` reports every model as `loading` and returns 503.
+`/v1/chat/completions` and the other inference endpoints answer 501.
+
+## Layout
+
+| Crate | What it is |
+| --- | --- |
+| `rkmodel-server` | The daemon. Loads models, serves `invoke` over gRPC. |
+| `rkmodel-server-protocol` | Generated tonic stubs, the domain types, and the error mapping. |
+| `rkmodel-server-client` | Rust client for the protocol. |
+| `rkmodel-server-openai` | The OpenAI-compatible HTTP frontend, a client of the daemon. |
+| `proto/` | Protocol schema, compiled by `tonic-build`. |
+
+## Building
+
+`protoc` is needed on the build host. Nothing on the board needs it.
+
+```sh
+cargo build --workspace
+cargo test --workspace
+```
+
+Cross-compiling for an RK3588 board, which needs
+`gcc-aarch64-linux-gnu` and the `aarch64-unknown-linux-gnu` target:
+
+```sh
+cargo build --release --target aarch64-unknown-linux-gnu
+```
+
+The linker is already set in `.cargo/config.toml`.
+
+## Running
+
+```sh
+rkmodel-server --config etc/rkmodel-server.example.toml
+rkmodel-server-openai --listen 127.0.0.1:8080 --daemon http://127.0.0.1:7070
+```
+
+The frontend connects lazily and reconnects on its own, so it can start before
+the daemon and survive a daemon restart. It answers 503 while the daemon is
+down.
+
+```sh
+curl -s localhost:8080/health
+curl -s localhost:8080/v1/models
+```
+
+The daemon listens on loopback by default and refuses any other address without
+a `token_file`, since TCP does not carry the file permissions a Unix socket
+would have.

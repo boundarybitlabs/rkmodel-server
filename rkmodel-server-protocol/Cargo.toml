@@ -1,0 +1,16 @@
+[package]
+name = "rkmodel-server-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire protocol for rkmodel-server: generated tonic stubs and the types the client trait speaks."
+
+[dependencies]
+tonic.workspace = true
+prost.workspace = true
+futures-core.workspace = true
+async-trait = "0.1"
+thiserror.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true

@@ -1,0 +1,28 @@
+[package]
+name = "rkmodel-server-openai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenAI-compatible HTTP frontend for rkmodel-server."
+
+[[bin]]
+name = "rkmodel-server-openai"
+path = "src/main.rs"
+
+[dependencies]
+rkmodel-server-protocol.workspace = true
+rkmodel-server-client.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+async-trait = "0.1"
+tokio-stream.workspace = true
+tower = { version = "0.5", features = ["util"] }
+tower-service = "0.3"
