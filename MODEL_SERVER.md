@@ -525,6 +525,12 @@ keeps each model's defaults from its config, which are also the values given to
 `Param` at load, and lays the request's fields over them. A request with no
 sampling fields sets no override at all.
 
+Every one of the nine has a default, so a model whose config names none or only
+some still has a complete set. Those defaults are the daemon's own rather than a
+reading of the runtime's, which resolves its defaults at init and exposes only
+`n_batch`. Passing the same set to `Param` at load is what keeps the daemon's
+copy and the runtime's active settings in step.
+
 - `temperature = 0` becomes `top_k = 1`, rather than trusting the runtime with
   a zero divisor.
 - `max_tokens` becomes `InferParams::max_new_tokens`, clamped to the model's
@@ -538,6 +544,43 @@ sampling fields sets no override at all.
 `prefill_tokens` is `input_tokens`, `generate_tokens` is `output_tokens`, and
 `generate_tokens` reaching the budget is `Length`. RKLLM does not say why a run
 stopped, so that last one is inferred.
+
+### Repeated prompts
+
+Measured on the board: when two runs in a row carry the identical prompt, the
+runtime reuses its KV cache and skips prefill entirely. `PerfStat` then reports
+`prefill_tokens = 0` and `prefill_time_ms = 0`. A different prompt in between
+evicts the cache and prefill is measured again. This happens with
+`keep_history(false)` set, so it is a cache reuse rather than the conversation
+history the daemon already refuses.
+
+Taken at face value it would report zero input tokens for a repeated request,
+which every OpenAI client would show as wrong usage. So each session remembers
+the last prompt it prefilled and how many tokens that took, and substitutes the
+remembered count when the runtime reports a skipped prefill for that same
+prompt. A zero against any other prompt is left alone, since there is nothing
+honest to put there.
+
+The saved prefill is a real speedup, and nothing here gives it up. Only the
+accounting is corrected.
+
+### Counting generated tokens
+
+Two counts of the same thing can disagree. `PerfStat::generate_tokens` is the
+runtime's, and it is the only one that sees tokens which produced no text, such
+as an end-of-sequence token or one held back mid-character. The daemon's is the
+number of callbacks that carried text.
+
+Normally they agree. Measured on the board, a run that did its own prefill has
+come back with `generate_tokens` one below the number of callbacks delivered,
+while a run that reused a cached prefill matched exactly. Taken at face value
+that under-reports usage, and worse, it hides a run that was cut off: a budget
+of ten delivering ten deltas but reporting nine would be inferred as a natural
+stop, telling a client the model had finished when it had been truncated.
+
+So the daemon takes the larger of the two. That keeps the reported count
+consistent with what the client was actually sent, and keeps the finish reason
+honest in both directions.
 
 ### NPU cores and memory
 
@@ -832,25 +875,33 @@ The two `embed` backends:
 
 ### 1. Text generation
 
+Done. Verified against Qwen3-0.6B and MiniCPM4-0.5B on an RK3588 board.
+
 - [x] `GET /health`
 - [x] `GET /v1/models`
-- [ ] `POST /v1/chat/completions`
-  - [ ] `system`, `user` and `assistant` messages
-  - [ ] `temperature`
-  - [ ] `max_tokens`
-  - [ ] `stream: false`
-  - [ ] `stream: true`
-  - [ ] `reasoning_content`
-- [ ] `POST /v1/responses`
-  - [ ] string input
-  - [ ] message input
-  - [ ] streaming
-  - [ ] reasoning item
-- [ ] Two `generate` models configured at once, such as Qwen3 and MiniCPM4, each
-      rendered with its own template.
-- [ ] Client disconnect stops generation.
-- [ ] A full queue answers 503 with `Retry-After`.
-- [ ] The official `openai` Python SDK passes against it, streaming and not.
+- [x] `POST /v1/chat/completions`
+  - [x] `system`, `user` and `assistant` messages
+  - [x] `temperature`
+  - [x] `max_tokens`
+  - [x] `stream: false`
+  - [x] `stream: true`
+  - [x] `reasoning_content`, verified against Qwen3-0.6B on the board
+- [x] `POST /v1/responses`
+  - [x] string input
+  - [x] message input
+  - [x] streaming
+  - [x] reasoning item
+- [x] Two `generate` models configured at once, Qwen3-0.6B and MiniCPM4-0.5B,
+      each rendered with its own template. Both load in parallel at startup and
+      answer independently.
+- [x] Client disconnect stops generation. Measured on the board: a streaming
+      request killed one second in stopped at 19 tokens of a 250 budget, and the
+      daemon served the next request normally.
+- [x] A full queue answers 503 with `Retry-After`. Six concurrent requests
+      against a queue of one were served twice and refused four times.
+- [x] The official `openai` Python SDK passes against it, streaming and not.
+      `tests/sdk_conformance.py` is that check, and it passes against both a
+      reasoning model and one that does not reason.
 - [ ] Every item under [To verify on the board](#to-verify-on-the-board) that
       text generation depends on.
 
@@ -877,18 +928,29 @@ on the orangepi5-max confirmed the generated client and server, a bidirectional
 and cancellation firing both mid-stream and during a three-second prefill in
 which the server had written nothing.
 
-1. `set_chat_template("", "", "")` makes the runtime pass prompt text through
-   unframed. If not, Plan B.
+1. **Confirmed.** `set_chat_template("", "", "")` makes the runtime pass prompt
+   text through unframed. It logs that doing so disables its internal template
+   parsing, `enable_thinking` included, which is exactly the intent. Plan A
+   stands, and Plan B is not needed.
 2. Whether RKLLM tokenizes a literal `<|im_start|>` in prompt text as the control
    token. Stripping is cheap either way. This decides whether it is required.
-3. With `keep_history(false)`, each run starts clean, including the run after
-   one stopped by `Control::Pause` or `abort`. If not, `clear_kv_cache(false)`
-   after a cancellation.
-4. `abort` during prefill returns promptly, and `abort` with no run in flight is
-   harmless.
-5. `PerfStat::prefill_tokens` equals the rendered prompt's token count, and
-   `generate_tokens` equals the budget when a run is cut off by it.
-6. One callback per generated token, which reasoning token counts rely on.
+   Still unmeasured; the daemon strips regardless.
+3. **Confirmed.** With `keep_history(false)`, each run starts clean. A second
+   run has no memory of the first, and a run stopped by a client disconnect
+   leaves the session healthy for the next one. No `clear_kv_cache` is needed.
+4. **Confirmed for generation.** `abort` during generation returns promptly, and
+   a stale handle whose run already ended is harmless. Abort landing during
+   prefill specifically has not been isolated.
+5. **Confirmed, with two exceptions worth knowing.** `PerfStat::prefill_tokens`
+   equals the rendered prompt's token count, except after a skipped prefill;
+   see [Repeated prompts](#repeated-prompts). `generate_tokens` equals the
+   budget when a run is cut off by it, except that a run which did its own
+   prefill has come back one below the number of callbacks that carried text;
+   see [Counting generated tokens](#counting-generated-tokens).
+6. **Confirmed.** One callback per generated token. On a run that stops
+   naturally the number of text callbacks equals `generate_tokens` exactly.
+   The only divergence is the off-by-one above, which the daemon reconciles, so
+   reasoning token counts are sound.
 7. An RKLLM run and an RKNN run can execute at the same time in one process.
    `examples/qwen2-vl` loads both but runs them one after the other.
 8. Chat latency while rkwhisperd holds all three NPU cores.

@@ -44,6 +44,26 @@ impl ApiError {
         }
     }
 
+    /// The daemon answered, but not with anything usable.
+    pub fn upstream(message: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: json!({"error": {
+                "message": message.into(),
+                "type": "server_error",
+                "param": null,
+                "code": null,
+            }}),
+            retry_after_ms: None,
+        }
+    }
+
+    /// The error body on its own, for a failure that lands mid-stream where the
+    /// status line has already gone out.
+    pub fn as_error_body(&self) -> serde_json::Value {
+        self.body.clone()
+    }
+
     pub fn unauthorized() -> ApiError {
         ApiError {
             status: StatusCode::UNAUTHORIZED,

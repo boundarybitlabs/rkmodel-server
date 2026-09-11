@@ -9,10 +9,27 @@ there.
 
 ## State
 
-A skeleton. The protocol, the client, the daemon's config and validation, and
-the endpoints that need no model worker are in place and tested. Nothing loads
-weights yet, so `/health` reports every model as `loading` and returns 503.
-`/v1/chat/completions` and the other inference endpoints answer 501.
+Text generation works end to end on an RK3588 board. Both
+`/v1/chat/completions` and `/v1/responses` are served, streaming and not, with
+reasoning split into its own field. The official `openai` Python SDK passes
+against both, on a reasoning model and one that does not reason.
+`/v1/audio/transcriptions` and `/v1/embeddings` answer 501 until their
+milestones land.
+
+```sh
+curl localhost:8080/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model": "minicpm4-0.5b", "messages": [{"role": "user", "content": "hi"}]}'
+```
+
+## Conformance
+
+`tests/sdk_conformance.py` drives the official SDK against a running frontend,
+streaming and not, and checks the typed events rather than our own idea of them.
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install openai
+.venv/bin/python tests/sdk_conformance.py http://127.0.0.1:8080/v1 minicpm4-0.5b
+```
 
 ## Layout
 

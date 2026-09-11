@@ -538,6 +538,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -571,10 +581,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "memo-map"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5449c8c750f1a07ea702bbd212bd999fceece9b3d1508b17023b3e174583124b"
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "minijinja"
+version = "2.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86886cf6dbf4e614b19c9a1eec9775f021869d7eadde0fc73921a81b90c9b4c9"
+dependencies = [
+ "memo-map",
+ "serde",
+]
+
+[[package]]
+name = "minijinja-contrib"
+version = "2.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd3e5f077bc2379f0f7d911e7cfdd921114ed99fc884533dca502944cb355b11"
+dependencies = [
+ "minijinja",
+ "serde",
+]
 
 [[package]]
 name = "mio"
@@ -811,15 +847,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "rkllm"
+version = "0.1.0"
+source = "git+https://github.com/boundarybitlabs/rkllm-rs?branch=main#85830baf529f288160808d91bc06132b6fb921b0"
+dependencies = [
+ "rkllm-sys",
+]
+
+[[package]]
+name = "rkllm-sys"
+version = "0.1.0"
+source = "git+https://github.com/boundarybitlabs/rkllm-rs?branch=main#85830baf529f288160808d91bc06132b6fb921b0"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "rkmodel-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
  "clap",
+ "minijinja",
+ "minijinja-contrib",
  "prost",
+ "rkllm",
  "rkmodel-server-protocol",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-stream",
@@ -848,9 +904,11 @@ name = "rkmodel-server-openai"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum",
  "clap",
+ "futures-core",
  "rkmodel-server-client",
  "rkmodel-server-protocol",
  "serde",

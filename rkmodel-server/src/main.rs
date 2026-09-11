@@ -1,8 +1,11 @@
 //! The daemon. Loads models onto the NPU and serves them over gRPC.
 
 mod config;
+mod generate;
+mod models;
 mod registry;
 mod service;
+mod worker;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -49,7 +52,12 @@ async fn main() -> Result<()> {
     for m in registry.list() {
         tracing::info!(model = %m.id, state = m.state.as_str(), "configured");
     }
-    tracing::warn!("model loading is not implemented yet, so no model reports ready");
+
+    // Weights take a long time to read, so each model loads on its own thread.
+    // The daemon serves straight away, reporting `loading` until they finish,
+    // and a model that fails to load leaves the others running.
+    let models = Arc::new(models::Models::default());
+    models::spawn_loaders(&config, registry.clone(), models.clone());
 
     tracing::info!(%listen, "serving");
     Server::builder()
@@ -57,7 +65,7 @@ async fn main() -> Result<()> {
         .http2_keepalive_timeout(Some(Duration::from_secs(5)))
         .tcp_nodelay(true)
         .add_service(pb::rk_model_server_server::RkModelServerServer::new(
-            service::Service::new(registry),
+            service::Service::new(registry, models),
         ))
         .serve_with_shutdown(listen, async {
             let _ = tokio::signal::ctrl_c().await;

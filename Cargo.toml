@@ -27,8 +27,14 @@ axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+minijinja = { version = "2", features = ["loader", "builtins"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
+# Default feature is libloading, which resolves the runtime's symbols by dlopen
+# at run time. That keeps librkllmrt off the build host, so the daemon
+# cross-compiles for the board from anywhere.
+rkllm = { git = "https://github.com/boundarybitlabs/rkllm-rs", branch = "main" }
