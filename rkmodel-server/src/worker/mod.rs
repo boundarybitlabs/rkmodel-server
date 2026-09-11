@@ -170,12 +170,16 @@ fn run_job(inner: &Arc<Inner>, mut job: Job) {
 
     *inner.current.lock().expect("worker lock") = Some(job.id);
 
-    let mut sent_any = false;
+    // Counted here rather than taken from the runtime. Measured on the board:
+    // when a run does its own prefill, `generate_tokens` can come back one
+    // below the number of callbacks that actually carried text, which would
+    // report a truncated answer as a natural stop. See `generated`.
+    let mut text_callbacks = 0u32;
     let result = {
         let events = job.events.clone();
         let cancelled = job.cancelled.clone();
         let parser = &mut job.parser;
-        let sent_any = &mut sent_any;
+        let text_callbacks = &mut text_callbacks;
         inner.backend.run(
             &job.prompt,
             job.sampling,
@@ -189,8 +193,8 @@ fn run_job(inner: &Arc<Inner>, mut job: Job) {
                     // character completes. Nothing to forward.
                     return backend::Flow::Continue;
                 };
+                *text_callbacks += 1;
                 for p in parser.push(text) {
-                    *sent_any = true;
                     if events.blocking_send(Ok(event_for(p))).is_err() {
                         // Nobody is listening any more.
                         return backend::Flow::Stop;
@@ -214,17 +218,16 @@ fn run_job(inner: &Arc<Inner>, mut job: Job) {
         }
         Ok(stats) => {
             for p in job.parser.finish() {
-                sent_any = true;
                 if job.events.blocking_send(Ok(event_for(p))).is_err() {
                     return;
                 }
             }
-            let _ = sent_any;
+            let generated = generated_tokens(stats.generate_tokens, text_callbacks);
             let _ = job.events.blocking_send(Ok(Event::Done {
-                finish: finish_reason(stats.generate_tokens, job.max_new_tokens),
+                finish: finish_reason(generated, job.max_new_tokens),
                 usage: Usage {
                     input_tokens: stats.prefill_tokens,
-                    output_tokens: stats.generate_tokens,
+                    output_tokens: generated,
                     reasoning_tokens: job.parser.reasoning_tokens(),
                 },
             }));
@@ -237,6 +240,18 @@ fn event_for(piece: Piece) -> Event {
         Piece::Reasoning(s) => Event::ReasoningDelta(s),
         Piece::Text(s) => Event::TextDelta(s),
     }
+}
+
+/// How many tokens this run produced, reconciling two counts that disagree.
+///
+/// The runtime's `generate_tokens` is normally right, and is the only one that
+/// sees tokens which produced no text, such as an end-of-sequence token or one
+/// held back mid-character. But on the board it has also come back one below
+/// the number of callbacks that carried text, which would both under-report
+/// usage and hide a run that was cut off by its budget. Taking the larger keeps
+/// the reported count consistent with what the client was actually sent.
+fn generated_tokens(reported: u32, text_callbacks: u32) -> u32 {
+    reported.max(text_callbacks)
 }
 
 /// RKLLM does not say why a run stopped, so hitting the budget is inferred.
@@ -501,6 +516,38 @@ mod tests {
             drop(handle);
         }
         assert_eq!(runs.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_under_reports_still_shows_length() {
+        // The board does this: ten callbacks carried text, and the runtime
+        // reported nine tokens against a budget of ten. Reporting `stop` would
+        // tell a client the model finished when it was cut off.
+        let mut backend = FakeBackend::new(&["a", "b", "c", "d", "e"]);
+        backend.stats.generate_tokens = 4;
+        let w = Worker::start("m".into(), Arc::new(backend), 4);
+        let (rx, handle) = w.submit("p".into(), None, Some(5), parser()).unwrap();
+        let events = drain(rx).await;
+        drop(handle);
+
+        assert_eq!(deltas(&events), "abcde");
+        match events.last() {
+            Some(Ok(Event::Done { finish, usage })) => {
+                assert_eq!(*finish, FinishReason::Length);
+                assert_eq!(usage.output_tokens, 5, "usage matches what was sent");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_larger_of_the_two_counts_wins() {
+        // The runtime sees tokens that carried no text, so it can legitimately
+        // report more than the callbacks did.
+        assert_eq!(generated_tokens(12, 10), 12);
+        // And it has been seen reporting one fewer than it delivered.
+        assert_eq!(generated_tokens(9, 10), 10);
+        assert_eq!(generated_tokens(0, 0), 0);
     }
 
     #[test]

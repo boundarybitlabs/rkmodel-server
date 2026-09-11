@@ -367,6 +367,50 @@ mod tests {
         assert_eq!(extract_template(&config).as_deref(), Some("DEFAULT"));
     }
 
+    /// The real template Qwen3-0.6B ships, not a stand-in. It leans on Python
+    /// string methods throughout, which is the case minijinja alone cannot
+    /// render.
+    const QWEN3_REAL: &str = include_str!("../../fixtures/qwen3-chat-template.jinja");
+
+    fn qwen3_real() -> ChatTemplate {
+        let mut special = BTreeSet::new();
+        special.insert("<|im_start|>".to_string());
+        special.insert("<|im_end|>".to_string());
+        ChatTemplate::from_source(QWEN3_REAL.to_string(), special).unwrap()
+    }
+
+    #[test]
+    fn the_real_qwen3_template_renders_with_reasoning_off() {
+        let got = qwen3_real().render(&convo(), false).unwrap();
+        assert_eq!(
+            got,
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n\
+             <|im_start|>user\nWhy is the sky blue?<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn the_real_qwen3_template_leaves_the_block_to_the_model_when_reasoning_is_on() {
+        let got = qwen3_real().render(&convo(), true).unwrap();
+        assert!(got.ends_with("<|im_start|>assistant\n"), "{got:?}");
+        assert!(!got.contains("<think>"), "{got:?}");
+    }
+
+    #[test]
+    fn the_real_qwen3_template_drops_reasoning_from_earlier_turns() {
+        // Its own template strips anything before </think> out of an assistant
+        // turn, so earlier reasoning is never sent back to the model.
+        let messages = vec![
+            Message::text(Role::User, "first"),
+            Message::text(Role::Assistant, "<think>pondering</think>the answer"),
+            Message::text(Role::User, "second"),
+        ];
+        let got = qwen3_real().render(&messages, true).unwrap();
+        assert!(!got.contains("pondering"), "{got:?}");
+        assert!(got.contains("the answer"), "{got:?}");
+    }
+
     #[test]
     fn a_broken_template_fails_at_load_not_at_render() {
         let err = match ChatTemplate::from_source("{% for x in %}".into(), BTreeSet::new()) {

@@ -564,6 +564,24 @@ honest to put there.
 The saved prefill is a real speedup, and nothing here gives it up. Only the
 accounting is corrected.
 
+### Counting generated tokens
+
+Two counts of the same thing can disagree. `PerfStat::generate_tokens` is the
+runtime's, and it is the only one that sees tokens which produced no text, such
+as an end-of-sequence token or one held back mid-character. The daemon's is the
+number of callbacks that carried text.
+
+Normally they agree. Measured on the board, a run that did its own prefill has
+come back with `generate_tokens` one below the number of callbacks delivered,
+while a run that reused a cached prefill matched exactly. Taken at face value
+that under-reports usage, and worse, it hides a run that was cut off: a budget
+of ten delivering ten deltas but reporting nine would be inferred as a natural
+stop, telling a client the model had finished when it had been truncated.
+
+So the daemon takes the larger of the two. That keeps the reported count
+consistent with what the client was actually sent, and keeps the finish reason
+honest in both directions.
+
 ### NPU cores and memory
 
 The RK3588 NPU has three cores, now shared by two daemons.
@@ -920,12 +938,16 @@ which the server had written nothing.
 4. **Confirmed for generation.** `abort` during generation returns promptly, and
    a stale handle whose run already ended is harmless. Abort landing during
    prefill specifically has not been isolated.
-5. **Confirmed, with one exception worth knowing.** `PerfStat::prefill_tokens`
-   equals the rendered prompt's token count, and `generate_tokens` equals the
-   budget when a run is cut off by it. The exception is [Repeated
-   prompts](#repeated-prompts) below.
-6. One callback per generated token, which reasoning token counts rely on. Still
-   unmeasured.
+5. **Confirmed, with two exceptions worth knowing.** `PerfStat::prefill_tokens`
+   equals the rendered prompt's token count, except after a skipped prefill;
+   see [Repeated prompts](#repeated-prompts). `generate_tokens` equals the
+   budget when a run is cut off by it, except that a run which did its own
+   prefill has come back one below the number of callbacks that carried text;
+   see [Counting generated tokens](#counting-generated-tokens).
+6. **Confirmed.** One callback per generated token. On a run that stops
+   naturally the number of text callbacks equals `generate_tokens` exactly.
+   The only divergence is the off-by-one above, which the daemon reconciles, so
+   reasoning token counts are sound.
 7. An RKLLM run and an RKNN run can execute at the same time in one process.
    `examples/qwen2-vl` loads both but runs them one after the other.
 8. Chat latency while rkwhisperd holds all three NPU cores.
