@@ -538,6 +538,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -837,6 +847,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "rkllm"
+version = "0.1.0"
+source = "git+https://github.com/boundarybitlabs/rkllm-rs?branch=main#85830baf529f288160808d91bc06132b6fb921b0"
+dependencies = [
+ "rkllm-sys",
+]
+
+[[package]]
+name = "rkllm-sys"
+version = "0.1.0"
+source = "git+https://github.com/boundarybitlabs/rkllm-rs?branch=main#85830baf529f288160808d91bc06132b6fb921b0"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "rkmodel-server"
 version = "0.1.0"
 dependencies = [
@@ -846,6 +872,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "prost",
+ "rkllm",
  "rkmodel-server-protocol",
  "serde",
  "serde_json",

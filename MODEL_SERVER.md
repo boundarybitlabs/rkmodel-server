@@ -545,6 +545,25 @@ copy and the runtime's active settings in step.
 `generate_tokens` reaching the budget is `Length`. RKLLM does not say why a run
 stopped, so that last one is inferred.
 
+### Repeated prompts
+
+Measured on the board: when two runs in a row carry the identical prompt, the
+runtime reuses its KV cache and skips prefill entirely. `PerfStat` then reports
+`prefill_tokens = 0` and `prefill_time_ms = 0`. A different prompt in between
+evicts the cache and prefill is measured again. This happens with
+`keep_history(false)` set, so it is a cache reuse rather than the conversation
+history the daemon already refuses.
+
+Taken at face value it would report zero input tokens for a repeated request,
+which every OpenAI client would show as wrong usage. So each session remembers
+the last prompt it prefilled and how many tokens that took, and substitutes the
+remembered count when the runtime reports a skipped prefill for that same
+prompt. A zero against any other prompt is left alone, since there is nothing
+honest to put there.
+
+The saved prefill is a real speedup, and nothing here gives it up. Only the
+accounting is corrected.
+
 ### NPU cores and memory
 
 The RK3588 NPU has three cores, now shared by two daemons.
@@ -883,18 +902,25 @@ on the orangepi5-max confirmed the generated client and server, a bidirectional
 and cancellation firing both mid-stream and during a three-second prefill in
 which the server had written nothing.
 
-1. `set_chat_template("", "", "")` makes the runtime pass prompt text through
-   unframed. If not, Plan B.
+1. **Confirmed.** `set_chat_template("", "", "")` makes the runtime pass prompt
+   text through unframed. It logs that doing so disables its internal template
+   parsing, `enable_thinking` included, which is exactly the intent. Plan A
+   stands, and Plan B is not needed.
 2. Whether RKLLM tokenizes a literal `<|im_start|>` in prompt text as the control
    token. Stripping is cheap either way. This decides whether it is required.
-3. With `keep_history(false)`, each run starts clean, including the run after
-   one stopped by `Control::Pause` or `abort`. If not, `clear_kv_cache(false)`
-   after a cancellation.
-4. `abort` during prefill returns promptly, and `abort` with no run in flight is
-   harmless.
-5. `PerfStat::prefill_tokens` equals the rendered prompt's token count, and
-   `generate_tokens` equals the budget when a run is cut off by it.
-6. One callback per generated token, which reasoning token counts rely on.
+   Still unmeasured; the daemon strips regardless.
+3. **Confirmed.** With `keep_history(false)`, each run starts clean. A second
+   run has no memory of the first, and a run stopped by a client disconnect
+   leaves the session healthy for the next one. No `clear_kv_cache` is needed.
+4. **Confirmed for generation.** `abort` during generation returns promptly, and
+   a stale handle whose run already ended is harmless. Abort landing during
+   prefill specifically has not been isolated.
+5. **Confirmed, with one exception worth knowing.** `PerfStat::prefill_tokens`
+   equals the rendered prompt's token count, and `generate_tokens` equals the
+   budget when a run is cut off by it. The exception is [Repeated
+   prompts](#repeated-prompts) below.
+6. One callback per generated token, which reasoning token counts rely on. Still
+   unmeasured.
 7. An RKLLM run and an RKNN run can execute at the same time in one process.
    `examples/qwen2-vl` loads both but runs them one after the other.
 8. Chat latency while rkwhisperd holds all three NPU cores.

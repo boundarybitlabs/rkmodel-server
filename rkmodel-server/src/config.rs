@@ -44,7 +44,7 @@ pub enum Backend {
     Rkwhisper,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     pub id: String,
@@ -76,7 +76,7 @@ fn default_queue_depth() -> usize {
     8
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reasoning {
     pub start: String,
@@ -93,7 +93,7 @@ pub enum Pooling {
     Last,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Vision {
     pub rknn: PathBuf,
