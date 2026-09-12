@@ -60,6 +60,13 @@ pub struct ModelConfig {
     #[serde(default)]
     pub sampling: Sampling,
     pub vision: Option<Vision>,
+    /// Whether the runtime reads word embeddings from flash rather than
+    /// holding them resident. Unset leaves the runtime's own default.
+    ///
+    /// It matters for a model whose embedding tables dwarf its weights: the
+    /// toolkit stores them at fp16 while quantizing the layers to w8a8, so a
+    /// 2 GB model can carry 5 GB of embeddings.
+    pub embed_flash: Option<bool>,
 
     // rknn
     pub rknn: Option<PathBuf>,
@@ -185,6 +192,13 @@ impl ModelConfig {
         let ops = self.operations()?;
         if ops.is_empty() {
             bail!("model {}: no operations listed", self.id);
+        }
+        if self.embed_flash.is_some() && self.backend != Backend::Rkllm {
+            bail!(
+                "model {}: `embed_flash` is an rkllm setting, not {:?}",
+                self.id,
+                self.backend
+            );
         }
         match self.backend {
             Backend::Rkllm => {
@@ -373,6 +387,57 @@ mod tests {
         .unwrap();
         assert_eq!(c.models[0].sampling.temperature, 0.2);
         assert_eq!(c.models[0].sampling.top_k, Sampling::default().top_k);
+    }
+
+    #[test]
+    fn embed_flash_is_unset_unless_named() {
+        let c = parse(
+            r#"
+            [[models]]
+            id = "a"
+            operations = ["generate"]
+            backend = "rkllm"
+            rkllm = "/x.rkllm"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.models[0].embed_flash, None);
+    }
+
+    #[test]
+    fn embed_flash_parses_for_an_rkllm_model() {
+        let c = parse(
+            r#"
+            [[models]]
+            id = "gemma-4-e2b"
+            operations = ["generate"]
+            backend = "rkllm"
+            rkllm = "/models/gemma-4-e2b/gemma-4-e2b-w8a8-16k.rkllm"
+            embed_flash = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.models[0].embed_flash, Some(true));
+    }
+
+    /// It reaches `Param`, which only the rkllm backend builds, so a config
+    /// naming it anywhere else is asking for something that cannot happen.
+    #[test]
+    fn embed_flash_on_another_backend_is_refused() {
+        let err = parse(
+            r#"
+            [[models]]
+            id = "bge"
+            operations = ["embed"]
+            backend = "rknn"
+            rknn = "/models/bge/model.rknn"
+            tokenizer = "/models/bge/tokenizer.json"
+            embed_flash = true
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`embed_flash` is an rkllm setting"), "{err}");
     }
 
     #[test]

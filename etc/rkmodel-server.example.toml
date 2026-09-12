@@ -36,6 +36,18 @@ vision = { rknn = "/models/qwen3-vl-2b/vision.rknn", core_mask = [0] }
 chat_template = "/models/qwen3-vl-2b/chat_template.jinja"
 
 [[models]]
+id = "gemma-4-e2b"
+operations = ["generate"]
+backend = "rkllm"
+rkllm = "/models/gemma-4-e2b/gemma-4-E2B-it-w8a8-16k-rk3588.rkllm"
+chat_template = "/models/gemma-4-e2b/chat_template.jinja"
+max_context_len = 16384
+# The toolkit leaves both embedding tables at fp16 while quantizing the layers
+# to w8a8, so this file is 8 GB of which 5.5 GB is embeddings. Reading them from
+# flash is what makes it fit an 8 GB board.
+embed_flash = true
+
+[[models]]
 id = "bge-small-en-v1.5"
 operations = ["embed"]
 backend = "rknn"

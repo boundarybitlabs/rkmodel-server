@@ -78,6 +78,14 @@ impl RkllmBackend {
             param = param.max_new_tokens(n as i32);
         }
 
+        // The toolkit quantizes the layers to w8a8 but leaves the embedding
+        // tables at fp16, so a model's embeddings can outweigh its weights
+        // several times over. Reading them from flash keeps that region out of
+        // resident memory, at the cost of a read per token.
+        if let Some(from_flash) = model.embed_flash {
+            param = param.embed_flash(from_flash);
+        }
+
         // Streaming only works from a single-input session, and a batched one
         // needs exactly n_batch inputs per run. Batching is future work.
         param = param

@@ -360,6 +360,18 @@ vision = { rknn = "/models/qwen3-vl-2b/vision.rknn", core_mask = [0] }
 chat_template = "/models/qwen3-vl-2b/chat_template.jinja"
 
 [[models]]
+id = "gemma-4-e2b"
+operations = ["generate"]
+backend = "rkllm"
+rkllm = "/models/gemma-4-e2b/gemma-4-E2B-it-w8a8-16k-rk3588.rkllm"
+chat_template = "/models/gemma-4-e2b/chat_template.jinja"
+max_context_len = 16384
+# The toolkit leaves both embedding tables at fp16 while quantizing the layers
+# to w8a8, so this file is 8 GB of which 5.5 GB is embeddings. Reading them from
+# flash is what makes it fit an 8 GB board.
+embed_flash = true
+
+[[models]]
 id = "bge-small-en-v1.5"
 operations = ["embed"]
 backend = "rknn"
@@ -599,7 +611,15 @@ so the first thing to measure is how chat latency degrades while a
 transcription runs.
 
 Memory is the sum of every loaded model, since all of them stay resident, plus
-rkwhisperd's. The only measured figures so far are in rkllm-rs: MiniCPM4-0.5B at
+rkwhisperd's. A model's file size is not that sum, though. The toolkit quantizes
+the transformer to w8a8 but stores both embedding tables at fp16, so a small
+model can carry embeddings several times the weight of its layers: Gemma 4 E2B
+at 16K exports as 8.0 GB, of which 5.5 GB is the vocabulary and per-layer tables
+and 2.3 GB the int8 weight plan. `embed_flash` in a model's config sets RKLLM's
+`extend_param.embed_flash`, which leaves that region in the file and reads rows
+per token, so what goes resident is roughly the weight plan plus KV cache and
+buffers. Whether it covers the per-layer table as well as the vocabulary one is
+[To verify on the board](#to-verify-on-the-board). The only measured figures so far are in rkllm-rs: MiniCPM4-0.5B at
 633 MB, and the Qwen2-VL-2B encoder and language model together at 3.2 GB. The
 daemon logs resident memory after each load, so the budget for a given board is
 known rather than guessed.
@@ -998,8 +1018,11 @@ which the server had written nothing.
    the handshake names the model, so it catches a model rkwhisperd does not
    serve, and no audio follows, so rkwhisperd does no NPU work for it. Whether
    that is cheap enough to keep, and whether the interval belongs in config,
-   is still open
-   session, for `unavailable`.
+   is still open.
+10. Whether `embed_flash` moves both embedding tables out of resident memory or
+    only the vocabulary one. The daemon logs resident memory after each load, so
+    a Gemma 4 E2B load answers it: near 2.3 GB is both, near 7 GB is the
+    vocabulary table alone.
 
 ## Changes to other crates
 
