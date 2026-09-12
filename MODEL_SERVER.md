@@ -3,8 +3,8 @@
 The design, and the plan of record. Text generation runs end to end on an RK3588
 board: both chat endpoints, streaming and not, against two models loaded at
 once. Transcription is written and tested against a fake daemon, but has not met
-rkwhisperd on hardware yet. Embeddings and images are still ahead.
-[Milestones](#milestones) tracks where each one stands.
+rkwhisperd on hardware yet. Tool calling is specified, and embeddings and images
+are still ahead. [Milestones](#milestones) tracks where each one stands.
 
 `rkmodel-server` runs models on a Rockchip NPU and serves them over TCP.
 `rkmodel-server-openai` puts an OpenAI-compatible HTTP API in front of it, so an
@@ -70,7 +70,7 @@ So every call names both, and the daemon checks the pair against its config.
 
 | Operation | Runs through | Takes | Returns | OpenAI endpoints |
 | --- | --- | --- | --- | --- |
-| `generate` | `rkllm`, plus an `rknpu2` vision encoder for images | messages, images | text and reasoning, streamed | `/v1/chat/completions`, `/v1/responses` |
+| `generate` | `rkllm`, plus an `rknpu2` vision encoder for images | messages, images, tools | text, reasoning and tool calls, streamed | `/v1/chat/completions`, `/v1/responses` |
 | `embed` | an `rknpu2` encoder, or `rkllm` hidden states | text | one vector per input | `/v1/embeddings` |
 | `transcribe` | `rkwhisperd`, through `rkwhisper-client` | 16 kHz PCM, streamed | text and timed segments | `/v1/audio/transcriptions` |
 
@@ -83,7 +83,10 @@ queue. See [Workers and queues](#workers-and-queues).
 
 - Routing across several boards. TCP leaves room for it later.
 - Stored responses: `previous_response_id`, `GET /v1/responses/{id}`.
-- Tools, function calling and structured output.
+- Structured output, and enforcing a tool's schema. RKLLM exposes no grammar or
+  logit hook to constrain decoding with. Tool calling itself is in scope; see
+  [Tool calls](#tool-calls).
+- Built-in tools on `/v1/responses`, such as `web_search` and `file_search`.
 - Loading or evicting models while running.
 - Batching several requests into one forward pass.
 
@@ -167,11 +170,31 @@ struct GenerateInput {
     max_tokens: Option<u32>,
     /// None takes the model's configured default.
     reasoning: Option<bool>,
+    tools: Vec<Tool>,
+    /// None is `Auto` when there are tools.
+    tool_choice: Option<ToolChoice>,
+    /// None is true, as OpenAI's default is.
+    parallel_tool_calls: Option<bool>,
 }
 
-struct Message { role: Role, parts: Vec<Part> }
-enum Role { System, User, Assistant }
+struct Message {
+    role: Role,
+    parts: Vec<Part>,
+    /// Earlier reasoning, which templates render inside a tool loop.
+    reasoning: Option<String>,
+    /// On assistant turns.
+    tool_calls: Vec<ToolCall>,
+    /// On tool turns. Templates resolve it to the called function's name.
+    tool_call_id: Option<String>,
+}
+enum Role { System, User, Assistant, Tool }
 enum Part { Text(String), Image(Image) }
+
+/// A function the model may call. The schema stays JSON text, since it is
+/// arbitrary and only a template reads it.
+struct Tool { name: String, description: String, parameters_json: String }
+struct ToolCall { id: String, name: String, arguments_json: String }
+enum ToolChoice { None, Auto, Required, Function(String) }
 
 /// Decoded by the frontend. The daemon resizes and normalizes for its encoder.
 struct Image { width: u32, height: u32, rgb8: Vec<u8> }
@@ -184,7 +207,13 @@ struct TranscribeInput {
 }
 
 enum Output {
-    Generated { text: String, reasoning: Option<String>, finish: FinishReason, usage: Usage },
+    Generated {
+        text: String,
+        reasoning: Option<String>,
+        tool_calls: Vec<ToolCall>,
+        finish: FinishReason,
+        usage: Usage,
+    },
     Embedding { vector: Vec<f32>, tokens: u32 },
     Transcript { text: String, segments: Vec<Segment>, audio_s: f32 },
 }
@@ -192,11 +221,13 @@ enum Output {
 enum Event {
     ReasoningDelta(String),
     TextDelta(String),
+    /// Sent whole, once the call has parsed. See [Tool calls](#tool-calls).
+    ToolCall(ToolCall),
     Segment(Segment),
     Done { finish: FinishReason, usage: Usage },
 }
 
-enum FinishReason { Stop, Length }
+enum FinishReason { Stop, Length, ToolCalls }
 struct Usage { input_tokens: u32, output_tokens: u32, reasoning_tokens: u32 }
 struct Segment { text: String, start_s: f32, end_s: f32 }
 
@@ -209,6 +240,9 @@ struct ModelInfo {
     /// frontend downsizes to it, which keeps image payloads small.
     image_input: Option<(u32, u32)>,
     reasoning: bool,
+    /// Whether the model has a `tool_format`. The frontend refuses `tools` for
+    /// one that does not.
+    tools: bool,
 }
 
 enum ModelState { Loading, Ready, Failed(String), Unavailable }
@@ -217,7 +251,8 @@ enum ModelState { Loading, Ready, Failed(String), Unavailable }
 Prompts cross the wire as structured messages, not rendered text. Chat
 templates, image tags and reasoning markers are properties of a model, so they
 live in the daemon beside the model's config, and the frontend stays
-model-agnostic.
+model-agnostic. Tools cross the same way: as declarations and structured calls,
+never as a model's call syntax.
 
 ### Wire
 
@@ -338,6 +373,7 @@ backend = "rkllm"
 rkllm = "/models/qwen3-4b/qwen3-4b-w8a8.rkllm"
 chat_template = "/models/qwen3-4b/tokenizer_config.json"
 reasoning = { start = "<think>", end = "</think>", default = false }
+tool_format = "hermes"
 max_context_len = 4096
 max_new_tokens = 1024
 queue_depth = 8
@@ -365,6 +401,13 @@ operations = ["generate"]
 backend = "rkllm"
 rkllm = "/models/gemma-4-e2b/gemma-4-E2B-it-w8a8-16k-rk3588.rkllm"
 chat_template = "/models/gemma-4-e2b/chat_template.jinja"
+# The runtime tokenizes Gemma's prompts differently from Hugging Face, so this
+# model runs Plan B. See Rendering prompts.
+tokenizer = "/models/gemma-4-e2b/tokenizer.json"
+# Gemma's markers are special tokens, which reach the parsers only because the
+# daemon loads with skip_special_token off. See Markers that are special tokens.
+reasoning = { start = "<|channel>thought\n", end = "<channel|>", default = false }
+tool_format = "gemma4"
 max_context_len = 16384
 # The toolkit leaves both embedding tables at fp16 while quantizing the layers
 # to w8a8, so this file is 8 GB of which 5.5 GB is embeddings. Reading them from
@@ -500,6 +543,36 @@ be confirmed on the board:
   `tokenizer.json` and pass `Input::tokens`. This gives exact prompt lengths for
   context checks.
 
+Plan A has served Qwen3 and MiniCPM4 well, though nothing has compared their
+tokenization against Hugging Face's. **Gemma 4 E2B needs Plan B.** The
+runtime's own tokenizer does not tokenize Gemma's prompts the way Hugging
+Face's does, and Gemma behaves worse for it. Measured on the board, with
+`tokenizers` 0.21 and Gemma's `tokenizer.json` on the host:
+
+| Prompt | Hugging Face tokens | `prefill_tokens` as text | As those ids |
+| --- | --- | --- | --- |
+| A bare question, with `<bos>` | 16 | 18 | |
+| A tool declaration and a question, with `<bos>`, reasoning off | 92 | 99 | 92 |
+
+The ids went through `Input::tokens` untouched, and on the second prompt Gemma
+called the tool unprompted, `<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>`.
+Sent as text, the identical prompt got "Please specify a city or location". So a
+model config names its tokenizer, and a model with `tokenizer` set runs Plan B:
+
+```toml
+tokenizer = "/models/gemma-4-e2b/tokenizer.json"
+```
+
+The daemon tokenizes with the `tokenizers` crate, without adding special tokens,
+since the template writes `bos_token` itself. Plan B also closes the context
+check: a prompt longer than `max_context_len` is refused before the run.
+
+Images still need text, since `Input::multimodal` takes a prompt. For a model
+that needs both, rkllm-rs can already register a tokenizer callback, but the
+runtime only calls it for an `.rkllm` exported without its own tokenizer, which
+the toolkit supports. That is the route for Gemma with images, and it is
+untried on Gemma.
+
 `Input::enable_thinking` belongs to the runtime's built-in template, which both
 plans bypass. Reasoning is switched on and off in the rendered prompt instead.
 
@@ -526,9 +599,190 @@ frontend returns the reasoning as its own field.
   reasoning, empty content, and `Length`.
 - **Counting.** `reasoning_tokens` counts callbacks that arrive while the parser
   is inside reasoning, which assumes one callback per generated token.
-- **History.** Reasoning in earlier assistant turns is not sent back to the
-  model. Qwen3's template drops it, and the daemon ignores reasoning on input
-  messages.
+- **History.** Reasoning on input messages is passed to the template, which
+  decides. Qwen3's and Gemma 4's both drop it from turns before the last user
+  message, and both keep it on assistant turns after it, which inside a tool
+  loop is the reasoning that led to the calls being answered.
+
+### Markers that are special tokens
+
+**By default the runtime leaves special tokens out of callback text.** Gemma
+opens its reasoning with `<|channel>thought\n`, and `<|channel>` is a special
+token. On the board, a Gemma 4 E2B run with reasoning on returned content
+beginning `thought\n`, and `reasoning_tokens: 0`. The parser never saw the
+marker, so the reasoning leaked into the content.
+
+Qwen3 is unaffected, because `<think>` and `<tool_call>` are added tokens that
+are not flagged special, and they arrive as text. Gemma's reasoning and tool
+markers are all special: `<|channel>`, `<channel|>`, `<|tool_call>`,
+`<tool_call|>`, `<|tool_response>`, and the string delimiter `<|"|>`.
+
+This is `RKLLMParam::skip_special_token`, which the runtime's default param
+sets, and which rkllm-rs already exposes as `Param::skip_special_token`. The
+daemon has never set it. A probe on the board ran Qwen3-0.6B over a rendered
+tool prompt, printing every callback:
+
+| | `skip_special_token = true`, the default | `false` |
+| --- | --- | --- |
+| `<tool_call>`, id 151657, not special | `"<tool_call>"` | `"<tool_call>"` |
+| `<\|im_end\|>`, id 151645, special | `""` | `"<\|im_end\|>"` |
+
+Everything else in the two runs was identical, down to the token ids. So the
+daemon loads every generate model with `skip_special_token(false)`, and markers
+reach the parsers as text, special or not.
+
+What that changes:
+
+- **End-of-turn tokens now arrive as text.** Qwen3 ends with `<|im_end|>`, and
+  Gemma with `<turn|>`, or with `<eos>` after a tool call, and a client must see
+  none of them. The daemon drops the callback of any token the model's
+  `tokenizer_config.json` names as `eos_token`, or as Gemma's `eot_token`, by
+  id, since the id is on every callback. Anything else special that a model emits outside a marker, which
+  should be rare, passes through as text rather than being guessed at.
+- **Special tokens still get their own callback.** In the default mode the
+  special token's callback arrived with its id and empty text, not folded
+  into a neighbour. That keeps one callback per generated token, which
+  reasoning counts rely on.
+- **Restoring markers from token ids is not needed.** It would work, since the
+  ids are there, but it needs each model's `tokenizer.json` on the board, and
+  the setting makes it redundant.
+
+The same probe on Gemma 4 E2B, with the setting off, returned every marker as
+its own callback and its own text: `<|channel>` (id 100) and `<channel|>`
+around the reasoning, `<|tool_call>` (48), `<tool_call|>` (49), `<|"|>` (52),
+`<turn|>` (106) and `<eos>` (1).
+
+**Gemma needs `bos_token`, and the runtime does not add one.** Asked for the
+capital of France in a bare turn, Gemma 4 E2B answered "Please provide the text
+or context you are referring to", from 17 prefill tokens. The same prompt with
+`<bos>` in front answered "Paris", from 18. The daemon renders templates without
+`bos_token` today, so every Gemma request it has served went without one. That
+is a text generation bug, not only a tools one, and passing `bos_token` into the
+template context fixes it.
+
+### Tool calls
+
+The model's own chat template renders tools, just as it renders the rest of the
+conversation. Qwen3's reads `tools`, `message.tool_calls` and `role == "tool"`,
+and so does Gemma 4's. The daemon passes those through and parses the calls
+back out of the output.
+
+**Not `rkllm_set_function_tools`.** RKLLM has its own tools API, and rkllm-rs
+wraps it as `set_function_tools`. It configures the session, not a run, so a
+request's tools would mean reconfiguring under the run lock every time. And it
+feeds the runtime's built-in template, which Plan A turns off.
+
+#### Rendering
+
+Templates see the shapes Hugging Face passes:
+
+| Template variable | From |
+| --- | --- |
+| `tools` | `[{type: "function", function: {name, description, parameters}}]`, `parameters` parsed from `parameters_json` |
+| `message.tool_calls` | `[{id, type: "function", function: {name, arguments}}]`, `arguments` parsed to an object. Gemma's template raises on a string. |
+| `message.tool_call_id` | As given. Gemma's template resolves it to the function name, so ids must round-trip. |
+| `message.reasoning_content` | `Message::reasoning` |
+| `bos_token` | The model's, from `tokenizer_config.json`. Gemma's template emits it, and Gemma does not work without it. See [Markers that are special tokens](#markers-that-are-special-tokens). |
+
+The environment needs three things it does not have today:
+
+- **`tojson`, matching Python's.** The workspace builds minijinja without its
+  `json` feature, so Qwen3's `{{ tool | tojson }}` is an unknown filter and the
+  render fails. Turning the feature on is not enough either: minijinja's
+  filter escapes `<`, `>`, `&` and `'` as `\u003c` and the like for HTML, uses
+  compact separators, and sorts keys. Hugging Face's is `json.dumps` with
+  `ensure_ascii=False`: `", "` and `": "`, insertion order, nothing escaped. So
+  the daemon registers its own, with minijinja's `preserve_order` feature on.
+  With that filter, the real Qwen3 and Gemma 4 templates render a tool
+  round trip byte for byte as `transformers` 4.53 does, with reasoning on and
+  off. That comparison is a test.
+- **`raise_exception`**, which Hugging Face defines and Gemma's template calls.
+- **`bos_token`** in the context.
+
+At load, a model with a `tool_format` whose template does not read `tools`, per
+`Template::undeclared_variables`, fails with that reason.
+
+#### Formats
+
+`tool_format` names how a model writes a call, which decides the parser and the
+markers.
+
+| Format | Models | A call |
+| --- | --- | --- |
+| `hermes` | Qwen2.5, Qwen3 | `<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>` |
+| `gemma4` | Gemma 4 | `<\|tool_call>call:get_weather{city:<\|"\|>Paris<\|"\|>}<tool_call\|>` |
+
+Gemma's arguments are not JSON. Keys are bare, strings are delimited by the
+special token `<|"|>`, and objects, arrays, numbers, booleans and `null` are
+otherwise as JSON writes them. The parser converts them to JSON. Since `<|"|>`
+is a special token, it can never appear inside a string, so no escaping rule is
+needed.
+
+MiniCPM4's format is not yet looked at. Adding a model family's tools is adding
+a format, not changing the design.
+
+#### Parsing
+
+A tool-call parser runs after the reasoning parser and sees only its text
+pieces, so a model drafting a call inside its reasoning, which Qwen3 does, is
+never taken for a call.
+
+- Markers split across chunks are held back, as the reasoning parser holds
+  them.
+- Text outside a call is `TextDelta`, including prose before the first call.
+- A complete call becomes `Event::ToolCall`, with a fresh `call_…` id.
+  Arguments are not streamed as they are generated: a client receives each
+  call whole, which both SDKs accumulate without complaint, and it saves an
+  incremental parser for each format.
+- A call that does not parse, or names a function not in `tools`, is emitted as
+  text. Nothing is invented.
+- A run that emitted a call finishes `ToolCalls`. One cut off by its budget
+  inside a call flushes the held text as text and finishes `Length`.
+- After a call, Gemma's template expects `<|tool_response>` with the result in
+  the same turn, and that is not an end-of-sequence token. On the board Gemma
+  ended a call with `<eos>` instead, but a model that writes
+  `<|tool_response>` would go on to invent the result, so the parser stops the
+  run there with `Flow::Stop`.
+- With `parallel_tool_calls: false`, the parser stops the run after the first
+  call.
+
+#### Choosing a call
+
+RKLLM cannot constrain decoding, but Plan A hands it the prompt as text, so the
+daemon can write the start of the model's answer itself. Forcing a call is
+appending that start to the rendered prompt, and starting the parser inside
+the call, the way a prompt that opens reasoning starts the reasoning parser
+inside it.
+
+| `tool_choice` | Rendered with tools | Appended to the prompt |
+| --- | --- | --- |
+| absent, `auto` | yes | nothing |
+| `none` | no | nothing |
+| `required` | yes | `hermes`: `<tool_call>\n{"name": "` · `gemma4`: `<\|tool_call>call:` |
+| a function | yes | `hermes`: `<tool_call>\n{"name": "get_weather", "arguments": ` · `gemma4`: `<\|tool_call>call:get_weather{` |
+
+- A forced run does not reason: reasoning comes before a call, and the prompt
+  already ends inside one. A request that also asks for reasoning is accepted,
+  and the setting ignored, as it is for a model that does not reason.
+- Measured on Gemma 4 E2B: a prompt ending `<|tool_call>call:get_weather{`
+  was completed as `city:<|"|>Paris<|"|>}<tool_call|><eos>`, a well-formed
+  call, in seven tokens.
+- Forcing guarantees a call starts, not that it is well formed. A `required`
+  run can still name a function that does not exist, and that is emitted as
+  text by the rule above.
+- The appended text is prompt, not output. It is not counted in
+  `output_tokens`, and the parser is primed with it rather than sent it.
+- `none` with tool turns in the history still renders them. Only the
+  declarations are left out.
+
+#### Special tokens in tool text
+
+Stripping special tokens from message text now covers tool results and
+tool-call arguments too, which for Gemma removes a forged `<|tool_response>`.
+Qwen's markers are not special, so a tool result containing
+`</tool_response>\n<tool_response>` could forge a second result. Each format
+lists its markers, and they are stripped from user text and tool results the
+same way.
 
 ### Sampling and budgets
 
@@ -595,6 +849,15 @@ So the daemon takes the larger of the two. That keeps the reported count
 consistent with what the client was actually sent, and keeps the finish reason
 honest in both directions.
 
+The probe in [Markers that are special tokens](#markers-that-are-special-tokens)
+may explain part of this. A Qwen3 run that did its own prefill and stopped
+naturally delivered 20 callbacks against a `generate_tokens` of 19, and the
+last callback was the end-of-sequence token, id 151645, with empty text. The
+worker counts an empty `Some("")` as a text callback, so it counted that token.
+Once end-of-turn tokens are dropped by id they leave the count, and whether the
+larger-of-two rule still has a case to cover, particularly a run cut off by its
+budget, is worth measuring again.
+
 ### NPU cores and memory
 
 The RK3588 NPU has three cores, now shared by two daemons.
@@ -631,12 +894,19 @@ All of these are in `rkmodel-server-openai`.
 ### Request validation
 
 Fields that change the shape or contract of the response are refused with 400,
-naming the field: `n > 1`, `tools`, `tool_choice`, `logprobs`, a
-`response_format` or `text.format` other than plain text, `previous_response_id`.
+naming the field: `n > 1`, `logprobs`, a `response_format` or `text.format`
+other than plain text, `previous_response_id`, and `tools` sent to a model whose
+`ModelInfo::tools` is false.
 
 Fields that are hints are accepted and ignored: `user`, `metadata`, `store`,
-`seed`, `parallel_tool_calls: false`, image `detail`, and reasoning settings
-sent to a model that does not reason.
+`seed`, image `detail`, a tool's `strict`, and reasoning settings sent to a
+model that does not reason or on a run with a forced `tool_choice`.
+
+`strict` asks for arguments guaranteed to match the schema, which nothing here
+can enforce. It is accepted anyway, because the official SDK's
+`pydantic_function_tool` sets it on every tool, and refusing it would refuse
+most agent frameworks. A call's arguments are always valid JSON, but not
+necessarily valid against the schema.
 
 Anything unlisted is ignored, which is what OpenAI-compatible servers generally
 do, and what keeps new SDK versions working.
@@ -684,7 +954,8 @@ Both generation endpoints take the same settings, and map them to
 | Field | Handling |
 | --- | --- |
 | `model` | `generate` on that model. |
-| `messages` | `system`, `developer` (as system), `user`, `assistant`. Content is a string or an array of `text` parts. |
+| `messages` | `system`, `developer` (as system), `user`, `assistant`, `tool`. Content is a string or an array of `text` parts. See [Tools](#tools-on-both-endpoints). |
+| `tools`, `tool_choice`, `parallel_tool_calls` | See [Tools](#tools-on-both-endpoints). |
 | `temperature`, `top_p` | Sampling override. |
 | `max_completion_tokens`, `max_tokens` | Budget. The first wins when both are sent. |
 | `reasoning_effort` | See above. |
@@ -734,7 +1005,8 @@ its `Waiting` state, and those callbacks carry no text.
 | Field | Handling |
 | --- | --- |
 | `input` as a string | One user message. |
-| `input` as an array | Message items, with `role` and `content` as a string or parts: `input_text`, `output_text` in assistant turns, and `input_image` from milestone 3. Reasoning items are ignored. |
+| `input` as an array | Message items, with `role` and `content` as a string or parts: `input_text`, `output_text` in assistant turns, and `input_image` from milestone 4. `function_call` and `function_call_output` items, and reasoning items that precede a `function_call`. Other reasoning items are ignored. |
+| `tools`, `tool_choice`, `parallel_tool_calls` | See [Tools](#tools-on-both-endpoints). |
 | `instructions` | A system message placed first. |
 | `temperature`, `top_p` | Sampling override. |
 | `max_output_tokens` | Budget. |
@@ -840,6 +1112,58 @@ to check before assuming the example carries over:
   early language model layers. Whether the RKLLM export expects those, and
   whether they fit through the single `image_embed` buffer the C struct has,
   decides whether this path works unchanged.
+
+### Tools, on both endpoints
+
+Both build `GenerateInput::tools` and the tool fields of `Message`. Only
+function tools are accepted. Any other tool `type` is refused with 400, naming
+it.
+
+| | `/v1/chat/completions` | `/v1/responses` |
+| --- | --- | --- |
+| A tool | `{type: "function", function: {name, description, parameters, strict}}` | `{type: "function", name, description, parameters, strict}` |
+| `tool_choice` | `"none"`, `"auto"`, `"required"`, `{type: "function", function: {name}}` | `"none"`, `"auto"`, `"required"`, `{type: "function", name}` |
+| An earlier call | An `assistant` message's `tool_calls`, `arguments` as a JSON string | A `function_call` item, `{call_id, name, arguments}` |
+| Its result | A `tool` message, `{tool_call_id, content}` | A `function_call_output` item, `{call_id, output}` |
+| Earlier reasoning | The message's `reasoning_content` | A reasoning item before the call |
+| Refused | `functions`, `function_call`, `role: "function"`, the pre-tools API | Built-in tools |
+
+On `/v1/responses`, consecutive `function_call` items become one assistant
+message, and the reasoning item before them its `reasoning`. `call_id` is the
+`ToolCall::id`. A call's `arguments` that is not a JSON object, or a
+`tool_choice` naming a function not in `tools`, is refused with 400.
+
+**Non-streaming answers.** A chat completion's message carries `tool_calls`,
+with `arguments` as a JSON string and `type: "function"`, `content` is `null`
+when the model wrote no text, and `finish_reason` is `tool_calls`. A response's
+`output` carries one item per call after any reasoning and message items:
+
+```json
+{"type": "function_call", "id": "fc_…", "call_id": "call_…", "name": "get_weather",
+ "arguments": "{\"city\": \"Paris\"}", "status": "completed"}
+```
+
+A response that ends in calls has `"status": "completed"`.
+
+**Streaming chat completions.** Each `Event::ToolCall` is one chunk, carrying
+the whole call at its index:
+
+```json
+{"delta": {"tool_calls": [{"index": 0, "id": "call_…", "type": "function",
+  "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]}}
+```
+
+**Streaming responses.** Each `Event::ToolCall` is, in order:
+
+```text
+response.output_item.added              function_call item, arguments ""
+response.function_call_arguments.delta  the whole arguments
+response.function_call_arguments.done
+response.output_item.done
+```
+
+A message item already open when the first call arrives is closed first, with
+its `output_text.done`, `content_part.done` and `output_item.done`.
 
 ### `POST /v1/audio/transcriptions`
 
@@ -969,11 +1293,48 @@ board yet.
       generate's was.
 - [ ] `stream: true`, which rkwhisperd's segments already support.
 
-### 3. Images
+### 3. Tool calling
 
-Qwen3-VL on `/v1/responses`, after the two checks above.
+Specified in [Tool calls](#tool-calls) and
+[Tools, on both endpoints](#tools-on-both-endpoints). Nothing is written yet.
+Almost all of it tests off the board, since it is templates, parsers and
+adapters, and it adds no hardware path.
 
-### 4. Embeddings
+- [ ] Protocol: `Role::Tool`, `Tool`, `ToolCall`, `ToolChoice`, the tool fields
+      of `Message` and `GenerateInput`, `Event::ToolCall`,
+      `FinishReason::ToolCalls`, `ModelInfo::tools`, and a new minor
+      `protocol_version`
+- [ ] Template environment: a Python-compatible `tojson`, `raise_exception`,
+      `bos_token`, and `tools`, `tool_calls`, `tool_call_id` and
+      `reasoning_content` in the context
+  - [ ] The real Qwen3 and Gemma 4 templates render a tool round trip byte for
+        byte as `transformers` does
+- [ ] Load with `skip_special_token(false)`, dropping end-of-turn tokens by
+      id, which also fixes Gemma's reasoning split
+- [ ] `tool_format` in config, checked at load
+- [ ] Plan B for models with `tokenizer` set, which Gemma 4 needs to call
+      tools, or to answer well at all
+- [ ] The `hermes` parser
+- [ ] The `gemma4` parser, including its argument syntax and stopping at
+      `<|tool_response>`
+- [ ] `parallel_tool_calls: false` stops after the first call
+- [ ] `tool_choice`: `none`, `auto`, and `required` and a named function by
+      appending the start of a call to the prompt
+- [ ] Markers stripped from user text and tool results
+- [ ] `/v1/chat/completions`: tools, tool turns, `tool_calls` streaming and not
+- [ ] `/v1/responses`: tools, `function_call` and `function_call_output` items,
+      streaming and not
+- [ ] The official SDK covers both in `tests/sdk_conformance.py`: a full round
+      trip, the stream accumulators, and a forced call
+- [ ] On the board: a multi-turn tool loop on Qwen3 and on Gemma 4 E2B, with
+      reasoning on and off, and each item under
+      [To verify on the board](#to-verify-on-the-board) that tools depend on
+
+### 4. Images
+
+Qwen3-VL on `/v1/responses`, after the two transcription checks above.
+
+### 5. Embeddings
 
 After choosing a model, which settles the backend, tokenizer, sequence length
 and pooling.
@@ -1019,10 +1380,33 @@ which the server had written nothing.
    serve, and no audio follows, so rkwhisperd does no NPU work for it. Whether
    that is cheap enough to keep, and whether the interval belongs in config,
    is still open.
-10. Whether `embed_flash` moves both embedding tables out of resident memory or
-    only the vocabulary one. The daemon logs resident memory after each load, so
-    a Gemma 4 E2B load answers it: near 2.3 GB is both, near 7 GB is the
-    vocabulary table alone.
+10. **Answered, from one reading.** Whether `embed_flash` moves both embedding
+    tables out of resident memory or only the vocabulary one. The daemon on the
+    board, serving Gemma 4 E2B alone at `max_context_len = 4096`, sat at 2.86 GB
+    `VmRSS`, nowhere near the 7 GB the vocabulary table alone would leave. So
+    both move. Nearly all of that is shared memory rather than anonymous or file
+    pages, which is presumably the runtime's NPU buffers.
+11. **Confirmed.** By default special tokens are left out of callback text, and
+    `skip_special_token(false)` puts them back. Measured on Qwen3-0.6B and
+    Gemma 4 E2B. See
+    [Markers that are special tokens](#markers-that-are-special-tokens).
+12. **Confirmed.** A special token gets its own callback, with its id. With the
+    setting off, Gemma's `<|channel>`, `<channel|>`, `<|tool_call>`,
+    `<tool_call|>`, `<|"|>`, `<turn|>` and `<eos>` each arrived as their text.
+13. **Answered: no.** The runtime adds no BOS token to a text prompt, and Gemma
+    answers nonsense without one. `<bos>` in the rendered prompt added exactly
+    one prefill token and fixed the answer.
+14. **Answered for the two models on the board.** How reliably each model calls
+    tools, at its size and quantization. Qwen3-0.6B, with reasoning off, wrote
+    a well-formed call unprompted. Gemma 4 E2B did too, but only from Hugging
+    Face's token ids: as text, the runtime tokenized the prompt into 99 tokens
+    rather than 92, and Gemma never called. With reasoning on, even from the
+    right ids, Gemma read its own tool declaration back as malformed and
+    answered without the tool. So reasoning with tools on Gemma 4 E2B is not
+    usable at this quantization, and forcing a call is the reliable path when
+    reasoning is wanted.
+15. Which tokens the runtime's tokenizer splits differently for Gemma. Plan B
+    makes it moot for text, but it matters for images, which need text.
 
 ## Changes to other crates
 
@@ -1069,6 +1453,10 @@ Three systemd units on the board:
   frontend, both streaming and not. The SDK's typed events catch a malformed
   stream, including the reasoning event sequence above, which is the part of
   the Responses API most worth checking against it.
+- **Templates, anywhere.** Each model family's real template, rendered with
+  tools, calls, tool results and reasoning, against fixtures generated by
+  `transformers.apply_chat_template`. A difference in whitespace or key order is
+  a difference in what the model reads.
 - **Daemon, on the board.** The list above, then the SDK tests end to end.
 
 ## Open questions
@@ -1084,4 +1472,4 @@ Three systemd units on the board:
 3. **Ports.** `7070` for the daemon and `8080` for the frontend are
    placeholders.
 4. **The first embedding model**, which picks between the RKNN and RKLLM
-   backends for milestone 4.
+   backends for milestone 5.
