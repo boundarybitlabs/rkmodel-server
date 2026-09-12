@@ -9,6 +9,7 @@
 //! Above the trait is ordinary Rust with tests; below it is a Unix socket and a
 //! shared-memory ring that only exist where rkwhisperd runs.
 
+pub mod probe;
 pub mod rkwhisper;
 
 use std::sync::Arc;
@@ -34,6 +35,15 @@ pub type Halves = (Box<dyn AsrSender>, Box<dyn AsrReceiver>);
 pub trait Asr: Send + Sync {
     /// Opens one session. `language` unset takes rkwhisper's default, `en`.
     async fn open(&self, model: &str, language: Option<&str>) -> Result<Halves, Error>;
+
+    /// Whether this model can be transcribed on right now.
+    ///
+    /// Opening a session and dropping it is exactly that question: the
+    /// handshake names the model, and no audio follows, so rkwhisperd does no
+    /// work for it. See [`probe`].
+    async fn probe(&self, model: &str) -> Result<(), Error> {
+        self.open(model, None).await.map(|_| ())
+    }
 }
 
 #[async_trait::async_trait]

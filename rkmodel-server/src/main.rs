@@ -65,6 +65,15 @@ async fn main() -> Result<()> {
     let asr = config.rkwhisper_socket.clone().map(|socket| {
         Arc::new(transcribe::rkwhisper::Rkwhisper::new(socket)) as Arc<dyn transcribe::Asr>
     });
+    if let Some(asr) = &asr {
+        let transcribe_models = config
+            .models
+            .iter()
+            .filter(|m| m.backend == config::Backend::Rkwhisper)
+            .map(|m| m.id.clone())
+            .collect();
+        transcribe::probe::spawn(transcribe_models, asr.clone(), registry.clone());
+    }
 
     tracing::info!(%listen, "serving");
     Server::builder()
