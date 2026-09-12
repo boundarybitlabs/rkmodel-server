@@ -240,8 +240,7 @@ struct ModelInfo {
     /// frontend downsizes to it, which keeps image payloads small.
     image_input: Option<(u32, u32)>,
     reasoning: bool,
-    /// Whether the model has a `tool_format`. The frontend refuses `tools` for
-    /// one that does not.
+    /// Whether the model has a `tool_format`, and so takes tools.
     tools: bool,
 }
 
@@ -896,8 +895,10 @@ All of these are in `rkmodel-server-openai`.
 
 Fields that change the shape or contract of the response are refused with 400,
 naming the field: `n > 1`, `logprobs`, a `response_format` or `text.format`
-other than plain text, `previous_response_id`, and `tools` sent to a model whose
-`ModelInfo::tools` is false.
+other than plain text, `previous_response_id`, the pre-tools `functions` and
+`function_call`, and any tool but a function. `tools` sent to a model without a
+`tool_format` are refused by the daemon, which is the one place that knows, and
+reach the client as the same 400.
 
 Fields that are hints are accepted and ignored: `user`, `metadata`, `store`,
 `seed`, image `detail`, a tool's `strict`, and reasoning settings sent to a
@@ -1326,8 +1327,8 @@ is templates, parsers and adapters, and it adds no hardware path.
 - [x] `tool_choice`: `none`, `auto`, and `required` and a named function by
       appending the start of a call to the prompt
 - [x] Markers stripped from user text and tool results
-- [ ] `/v1/chat/completions`: tools, tool turns, `tool_calls` streaming and not
-- [ ] `/v1/responses`: tools, `function_call` and `function_call_output` items,
+- [x] `/v1/chat/completions`: tools, tool turns, `tool_calls` streaming and not
+- [x] `/v1/responses`: tools, `function_call` and `function_call_output` items,
       streaming and not
 - [ ] The official SDK covers both in `tests/sdk_conformance.py`: a full round
       trip, the stream accumulators, and a forced call

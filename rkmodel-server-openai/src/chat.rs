@@ -3,11 +3,12 @@
 //! A thin adapter over `GenerateInput`. `/v1/responses` builds the same thing,
 //! so neither endpoint holds logic the other lacks.
 
-use rkmodel_server_protocol::{FinishReason, GenerateInput, Message, Part, Role, Usage};
+use rkmodel_server_protocol::{FinishReason, GenerateInput, Message, Part, Role, ToolCall, Usage};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::ApiError;
+use crate::tools::{self, FunctionDef};
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -25,12 +26,19 @@ pub struct ChatRequest {
     pub stream: bool,
     pub stream_options: Option<StreamOptions>,
 
+    /// Parsed by hand rather than by serde, so a malformed tool is a 400 that
+    /// names the field instead of axum's 422.
+    pub tools: Option<Value>,
+    pub tool_choice: Option<Value>,
+    pub parallel_tool_calls: Option<bool>,
+
     // Fields that change the shape or contract of the response. Present means
     // refused, with the field named.
     pub n: Option<u32>,
-    pub tools: Option<Value>,
-    pub tool_choice: Option<Value>,
     pub logprobs: Option<Value>,
+    /// The API before tools, which nothing here speaks.
+    pub functions: Option<Value>,
+    pub function_call: Option<Value>,
     pub response_format: Option<Value>,
     // Everything unlisted is ignored, which is what OpenAI-compatible servers
     // generally do and what keeps new SDK versions working.
@@ -53,6 +61,31 @@ pub struct ChatMessage {
     pub role: String,
     #[serde(default)]
     pub content: Option<Content>,
+    /// On an assistant turn, the calls it made.
+    pub tool_calls: Option<Vec<ChatToolCall>>,
+    /// On a tool turn, the call it answers.
+    pub tool_call_id: Option<String>,
+    /// Earlier reasoning, which templates render inside a tool loop.
+    pub reasoning_content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatToolCall {
+    pub id: String,
+    pub function: ChatFunctionCall,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatFunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatTool {
+    #[serde(rename = "type")]
+    kind: String,
+    function: Option<FunctionDef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,16 +114,16 @@ impl ChatRequest {
                 ));
             }
         }
-        if present(&self.tools) {
+        if present(&self.functions) {
             return Err(ApiError::invalid_request(
-                "Tools are not supported.",
-                Some("tools"),
+                "functions is the API before tools, and is not supported. Use tools.",
+                Some("functions"),
             ));
         }
-        if present(&self.tool_choice) {
+        if present(&self.function_call) {
             return Err(ApiError::invalid_request(
-                "Tool choice is not supported.",
-                Some("tool_choice"),
+                "function_call is the API before tools, and is not supported. Use tool_choice.",
+                Some("function_call"),
             ));
         }
         if self.logprobs.as_ref().is_some_and(|v| v == &json!(true)) {
@@ -146,13 +179,36 @@ impl ChatRequest {
         for m in &self.messages {
             messages.push(m.to_message()?);
         }
+
+        let mut tools = Vec::new();
+        if let Some(value) = self.tools.filter(|v| !v.is_null()) {
+            let declared: Vec<ChatTool> = serde_json::from_value(value).map_err(|e| {
+                ApiError::invalid_request(format!("tools is malformed: {e}"), Some("tools"))
+            })?;
+            for tool in declared {
+                tools::check_function_type(&tool.kind, "tools")?;
+                let function = tool.function.ok_or_else(|| {
+                    ApiError::invalid_request("A function tool needs a function.", Some("tools"))
+                })?;
+                tools.push(function.into_tool("tools")?);
+            }
+        }
+        let tool_choice = self
+            .tool_choice
+            .as_ref()
+            .filter(|v| !v.is_null())
+            .map(|v| tools::parse_choice(v, "tool_choice"))
+            .transpose()?;
+
         Ok(GenerateInput {
             messages,
             temperature: self.temperature,
             top_p: self.top_p,
             max_tokens: budget,
             reasoning,
-            ..Default::default()
+            tools,
+            tool_choice,
+            parallel_tool_calls: self.parallel_tool_calls,
         })
     }
 }
@@ -169,6 +225,7 @@ impl ChatMessage {
             "developer" => Role::System,
             "user" => Role::User,
             "assistant" => Role::Assistant,
+            "tool" => Role::Tool,
             other => {
                 return Err(ApiError::invalid_request(
                     format!("Unsupported message role {other}."),
@@ -199,7 +256,25 @@ impl ChatMessage {
             }
         };
 
-        Ok(Message::new(role, parts))
+        let mut message = Message::new(role, parts);
+        if role == Role::Assistant {
+            message.reasoning = self.reasoning_content.clone();
+            for call in self.tool_calls.iter().flatten() {
+                tools::check_arguments(&call.function.arguments, "messages")?;
+                message.tool_calls.push(ToolCall {
+                    id: call.id.clone(),
+                    name: call.function.name.clone(),
+                    arguments_json: call.function.arguments.clone(),
+                });
+            }
+        }
+        if role == Role::Tool {
+            let id = self.tool_call_id.clone().ok_or_else(|| {
+                ApiError::invalid_request("A tool message needs a tool_call_id.", Some("messages"))
+            })?;
+            message.tool_call_id = Some(id);
+        }
+        Ok(message)
     }
 }
 
@@ -221,16 +296,28 @@ pub fn usage_json(usage: &Usage) -> Value {
 }
 
 /// The whole answer, for `stream: false`.
+#[allow(clippy::too_many_arguments)]
 pub fn completion_json(
     id: &str,
     created: u64,
     model: &str,
     text: String,
     reasoning: Option<String>,
+    tool_calls: &[ToolCall],
     finish: FinishReason,
     usage: &Usage,
 ) -> Value {
-    let mut message = json!({"role": "assistant", "content": text});
+    // A message that only calls tools has no content, which OpenAI writes as
+    // null rather than an empty string.
+    let content = if text.is_empty() && !tool_calls.is_empty() {
+        Value::Null
+    } else {
+        json!(text)
+    };
+    let mut message = json!({"role": "assistant", "content": content});
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = tool_calls.iter().map(tools::chat_tool_call_json).collect();
+    }
     // The name DeepSeek's API, vLLM and llama.cpp's server use, so clients that
     // already read reasoning from a chat completion find it there. Absent when
     // there was no reasoning.

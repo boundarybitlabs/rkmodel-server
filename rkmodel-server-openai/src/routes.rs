@@ -26,6 +26,7 @@ use crate::chat::{self, ChatRequest};
 use crate::error::ApiError;
 use crate::id;
 use crate::responses::{self, ResponsesRequest};
+use crate::tools;
 
 pub struct AppState {
     pub daemon: Arc<dyn RkModelServer>,
@@ -158,15 +159,22 @@ async fn chat_completions(
         let Some(Output::Generated {
             text,
             reasoning,
+            tool_calls,
             finish,
             usage,
-            ..
         }) = outputs.into_iter().next()
         else {
             return Err(ApiError::upstream("The daemon returned no generation."));
         };
         return Ok(Json(chat::completion_json(
-            &id, created, &model, text, reasoning, finish, &usage,
+            &id,
+            created,
+            &model,
+            text,
+            reasoning,
+            &tool_calls,
+            finish,
+            &usage,
         ))
         .into_response());
     }
@@ -192,6 +200,7 @@ async fn chat_completions(
         ));
 
         let mut done = None;
+        let mut calls = 0usize;
         while let Some(event) = events.next().await {
             match event {
                 Ok(Event::ReasoningDelta(s)) => {
@@ -200,9 +209,16 @@ async fn chat_completions(
                 Ok(Event::TextDelta(s)) => {
                     yield data(chat::chunk_json(&id, created, &model, json!({"content": s}), None));
                 }
+                Ok(Event::ToolCall(call)) => {
+                    // Each call arrives whole, so its one delta carries the id,
+                    // the name and every argument at once.
+                    let mut delta = tools::chat_tool_call_json(&call);
+                    delta["index"] = json!(calls);
+                    calls += 1;
+                    yield data(chat::chunk_json(&id, created, &model, json!({"tool_calls": [delta]}), None));
+                }
                 Ok(Event::Done { finish, usage }) => done = Some((finish, usage)),
-                // Tools are still refused at validation, so no call can arrive.
-                Ok(Event::Segment(_)) | Ok(Event::ToolCall(_)) => {}
+                Ok(Event::Segment(_)) => {}
                 Err(e) => {
                     yield data(ApiError::from(e).as_error_body());
                     return;
@@ -257,9 +273,9 @@ async fn responses_endpoint(
         let Some(Output::Generated {
             text,
             reasoning,
+            tool_calls,
             finish,
             usage,
-            ..
         }) = outputs.into_iter().next()
         else {
             return Err(ApiError::upstream("The daemon returned no generation."));
@@ -270,6 +286,7 @@ async fn responses_endpoint(
             &model,
             &text,
             reasoning.as_deref(),
+            &tool_calls,
             finish,
             &usage,
         ))
@@ -301,75 +318,27 @@ async fn responses_endpoint(
         yield ev!("response.created", json!({"response": in_progress(&ids)}));
         yield ev!("response.in_progress", json!({"response": in_progress(&ids)}));
 
-        let mut reasoning = String::new();
-        let mut text = String::new();
-        let mut reasoning_open = false;
-        let mut reasoning_closed = false;
-        let mut message_open = false;
+        let mut items = responses::StreamState::new(ids);
         let mut done: Option<(rkmodel_server_protocol::FinishReason, rkmodel_server_protocol::Usage)> = None;
         let mut failed = None;
 
         while let Some(event) = events.next().await {
-            match event {
-                Ok(Event::ReasoningDelta(delta)) => {
-                    if !reasoning_open {
-                        reasoning_open = true;
-                        yield ev!("response.output_item.added", json!({
-                            "output_index": 0,
-                            "item": responses::reasoning_item(&ids.reasoning, ""),
-                        }));
-                    }
-                    reasoning.push_str(&delta);
-                    yield ev!("response.reasoning_text.delta", json!({
-                        "item_id": ids.reasoning,
-                        "output_index": 0,
-                        "content_index": 0,
-                        "delta": delta,
-                    }));
+            let named = match event {
+                Ok(Event::ReasoningDelta(delta)) => items.reasoning_delta(&delta),
+                Ok(Event::TextDelta(delta)) => items.text_delta(&delta),
+                Ok(Event::ToolCall(call)) => items.tool_call(&call),
+                Ok(Event::Done { finish, usage }) => {
+                    done = Some((finish, usage));
+                    Vec::new()
                 }
-                Ok(Event::TextDelta(delta)) => {
-                    if reasoning_open && !reasoning_closed {
-                        reasoning_closed = true;
-                        yield ev!("response.reasoning_text.done", json!({
-                            "item_id": ids.reasoning,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "text": reasoning,
-                        }));
-                        yield ev!("response.output_item.done", json!({
-                            "output_index": 0,
-                            "item": responses::reasoning_item(&ids.reasoning, &reasoning),
-                        }));
-                    }
-                    let index = if reasoning_open { 1 } else { 0 };
-                    if !message_open {
-                        message_open = true;
-                        yield ev!("response.output_item.added", json!({
-                            "output_index": index,
-                            "item": responses::message_item(&ids.message, ""),
-                        }));
-                        yield ev!("response.content_part.added", json!({
-                            "item_id": ids.message,
-                            "output_index": index,
-                            "content_index": 0,
-                            "part": {"type": "output_text", "text": "", "annotations": []},
-                        }));
-                    }
-                    text.push_str(&delta);
-                    yield ev!("response.output_text.delta", json!({
-                        "item_id": ids.message,
-                        "output_index": index,
-                        "content_index": 0,
-                        "delta": delta,
-                    }));
-                }
-                Ok(Event::Done { finish, usage }) => done = Some((finish, usage)),
-                // Tools are still refused at validation, so no call can arrive.
-                Ok(Event::Segment(_)) | Ok(Event::ToolCall(_)) => {}
+                Ok(Event::Segment(_)) => Vec::new(),
                 Err(e) => {
                     failed = Some(ApiError::from(e));
                     break;
                 }
+            };
+            for (name, body) in named {
+                yield ev!(name, body);
             }
         }
 
@@ -386,63 +355,15 @@ async fn responses_endpoint(
             return;
         };
 
-        // A run cut off while still reasoning never produced a text delta. The
-        // message item is still emitted, empty, so the streamed output matches
-        // the non-streaming body.
-        if reasoning_open && !reasoning_closed {
-            yield ev!("response.reasoning_text.done", json!({
-                "item_id": ids.reasoning,
-                "output_index": 0,
-                "content_index": 0,
-                "text": reasoning,
-            }));
-            yield ev!("response.output_item.done", json!({
-                "output_index": 0,
-                "item": responses::reasoning_item(&ids.reasoning, &reasoning),
-            }));
+        for (name, body) in items.finish() {
+            yield ev!(name, body);
         }
-        let index = if reasoning_open { 1 } else { 0 };
-        if !message_open {
-            yield ev!("response.output_item.added", json!({
-                "output_index": index,
-                "item": responses::message_item(&ids.message, ""),
-            }));
-            yield ev!("response.content_part.added", json!({
-                "item_id": ids.message,
-                "output_index": index,
-                "content_index": 0,
-                "part": {"type": "output_text", "text": "", "annotations": []},
-            }));
-        }
-
-        yield ev!("response.output_text.done", json!({
-            "item_id": ids.message,
-            "output_index": index,
-            "content_index": 0,
-            "text": text,
-        }));
-        yield ev!("response.content_part.done", json!({
-            "item_id": ids.message,
-            "output_index": index,
-            "content_index": 0,
-            "part": {"type": "output_text", "text": text, "annotations": []},
-        }));
-        yield ev!("response.output_item.done", json!({
-            "output_index": index,
-            "item": responses::message_item(&ids.message, &text),
-        }));
-
-        let mut output = Vec::new();
-        if reasoning_open {
-            output.push(responses::reasoning_item(&ids.reasoning, &reasoning));
-        }
-        output.push(responses::message_item(&ids.message, &text));
         let final_body = responses::response_json(
-            &ids,
+            items.ids(),
             created,
             &model,
             responses::status_for(finish),
-            output,
+            items.output(),
             Some(finish),
             Some(&usage),
         );
@@ -533,7 +454,8 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use rkmodel_server_protocol::{
-        Error, EventStream, FinishReason, GenerateInput, ModelInfo, ModelState, Segment, Usage,
+        Error, EventStream, FinishReason, GenerateInput, ModelInfo, ModelState, Part, Role,
+        Segment, ToolCall, ToolChoice, Usage,
     };
     use std::sync::Mutex;
     use tower_service::Service as _;
@@ -1063,10 +985,135 @@ mod tests {
         refused("n", json!({"n": 2})).await;
     }
 
+    // ---- tools on chat completions -----------------------------------------
+
+    fn weather_call(id: &str, city: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "get_weather".into(),
+            arguments_json: format!(r#"{{"city":"{city}"}}"#),
+        }
+    }
+
+    fn calling(calls: Vec<ToolCall>) -> Fake {
+        Fake {
+            models: Some(vec![]),
+            outputs: vec![Output::Generated {
+                text: String::new(),
+                reasoning: None,
+                tool_calls: calls,
+                finish: FinishReason::ToolCalls,
+                usage: Usage::default(),
+            }],
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
-    async fn tools_are_refused() {
-        refused("tools", json!({"tools": [{"type": "function"}]})).await;
-        refused("tool_choice", json!({"tool_choice": "auto"})).await;
+    async fn tools_and_a_tool_loop_reach_the_daemon() {
+        let mut h = harness(calling(vec![]));
+        let body = json!({
+            "model": "qwen3-4b",
+            "messages": [
+                {"role": "user", "content": "Weather in Paris?"},
+                {"role": "assistant", "content": null, "reasoning_content": "need it",
+                 "tool_calls": [{"id": "call_1", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "21C"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "get_weather",
+                "description": "Current weather", "strict": true,
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+            "parallel_tool_calls": false,
+        });
+        let (status, response) = h.post("/v1/chat/completions", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+
+        let seen = h.daemon.seen.lock().unwrap()[0].clone();
+        assert_eq!(seen.tools.len(), 1);
+        assert_eq!(
+            seen.tools[0].parameters_json.as_deref(),
+            Some(r#"{"type":"object","properties":{"city":{"type":"string"}}}"#)
+        );
+        assert_eq!(
+            seen.tool_choice,
+            Some(ToolChoice::Function("get_weather".into()))
+        );
+        assert_eq!(seen.parallel_tool_calls, Some(false));
+        assert_eq!(seen.messages[1].reasoning.as_deref(), Some("need it"));
+        assert_eq!(seen.messages[1].tool_calls[0].id, "call_1");
+        assert_eq!(seen.messages[2].role, Role::Tool);
+        assert_eq!(seen.messages[2].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[tokio::test]
+    async fn a_completion_that_calls_tools_has_null_content() {
+        let mut h = harness(calling(vec![
+            weather_call("call_a", "Paris"),
+            weather_call("call_b", "London"),
+        ]));
+        let (_, body) = h.post("/v1/chat/completions", chat_body()).await;
+        let message = &body["choices"][0]["message"];
+        assert_eq!(message["content"], serde_json::Value::Null);
+        assert_eq!(message["tool_calls"][1]["id"], "call_b");
+        assert_eq!(message["tool_calls"][1]["type"], "function");
+        assert_eq!(message["tool_calls"][1]["function"]["name"], "get_weather");
+        assert_eq!(
+            message["tool_calls"][1]["function"]["arguments"],
+            r#"{"city":"London"}"#
+        );
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_call_is_one_delta_at_its_index() {
+        let mut h = harness(Fake::streaming(vec![
+            Ok(Event::ToolCall(weather_call("call_a", "Paris"))),
+            Ok(Event::ToolCall(weather_call("call_b", "London"))),
+            Ok(Event::Done {
+                finish: FinishReason::ToolCalls,
+                usage: Usage::default(),
+            }),
+        ]));
+        let mut body = chat_body();
+        body["stream"] = json!(true);
+        let (_, text) = h.post_raw("/v1/chat/completions", body).await;
+        let chunks = sse_data(&text);
+        let calls: Vec<_> = chunks
+            .iter()
+            .filter_map(|c| c["choices"][0]["delta"]["tool_calls"].as_array())
+            .collect();
+        assert_eq!(calls.len(), 2, "{text}");
+        assert_eq!(calls[0][0]["index"], 0);
+        assert_eq!(calls[1][0]["index"], 1);
+        assert_eq!(calls[1][0]["id"], "call_b");
+        assert_eq!(calls[1][0]["function"]["arguments"], r#"{"city":"London"}"#);
+        assert!(text.contains(r#""finish_reason":"tool_calls""#), "{text}");
+    }
+
+    #[tokio::test]
+    async fn tool_requests_it_cannot_serve_are_refused() {
+        refused("tools", json!({"tools": [{"type": "web_search"}]})).await;
+        refused(
+            "tools",
+            json!({"tools": [{"type": "function", "function": {"name": "f", "parameters": [1]}}]}),
+        )
+        .await;
+        refused("tool_choice", json!({"tool_choice": "sometimes"})).await;
+        refused("functions", json!({"functions": [{"name": "f"}]})).await;
+        refused("function_call", json!({"function_call": "auto"})).await;
+        refused(
+            "messages",
+            json!({"messages": [{"role": "tool", "content": "21C"}]}),
+        )
+        .await;
+        refused(
+            "messages",
+            json!({"messages": [{"role": "assistant", "tool_calls": [{"id": "c", "type": "function",
+                "function": {"name": "f", "arguments": "\"Paris\""}}]}]}),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1480,10 +1527,121 @@ mod tests {
         .await;
     }
 
+    // ---- tools on responses ------------------------------------------------
+
     #[tokio::test]
-    async fn responses_refuses_tools() {
+    async fn function_call_items_fold_into_one_assistant_turn() {
+        let mut h = harness(calling(vec![]));
+        let body = json!({
+            "model": "qwen3-4b",
+            "input": [
+                {"role": "user", "content": "Weather in Paris and London?"},
+                {"type": "reasoning", "id": "rs_1", "summary": [],
+                 "content": [{"type": "reasoning_text", "text": "need both"}]},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+                 "name": "get_weather", "arguments": "{\"city\": \"Paris\"}"},
+                {"type": "function_call", "id": "fc_2", "call_id": "call_2",
+                 "name": "get_weather", "arguments": "{\"city\": \"London\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "21C"},
+                {"type": "function_call_output", "call_id": "call_2",
+                 "output": [{"type": "input_text", "text": "15C"}]},
+            ],
+            "tools": [{"type": "function", "name": "get_weather", "description": "Current weather",
+                "parameters": {"type": "object"}, "strict": true}],
+            "tool_choice": {"type": "function", "name": "get_weather"},
+        });
+        let (status, response) = h.post("/v1/responses", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+
+        let seen = h.daemon.seen.lock().unwrap()[0].clone();
+        assert_eq!(seen.messages.len(), 4, "{:?}", seen.messages);
+        let turn = &seen.messages[1];
+        assert_eq!(turn.role, Role::Assistant);
+        assert_eq!(turn.reasoning.as_deref(), Some("need both"));
+        assert_eq!(turn.tool_calls.len(), 2);
+        assert_eq!(turn.tool_calls[1].id, "call_2");
+        assert_eq!(seen.messages[3].tool_call_id.as_deref(), Some("call_2"));
+        assert_eq!(seen.messages[3].parts, vec![Part::Text("15C".into())]);
+        assert_eq!(seen.tools[0].name, "get_weather");
+        assert_eq!(
+            seen.tool_choice,
+            Some(ToolChoice::Function("get_weather".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_that_calls_tools_lists_the_calls_and_no_empty_message() {
+        let mut h = harness(calling(vec![weather_call("call_a", "Paris")]));
+        let (_, body) = h.post("/v1/responses", responses_body()).await;
+        assert_eq!(body["status"], "completed");
+        let output = body["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1, "{body}");
+        assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(output[0]["id"], "fc_a");
+        assert_eq!(output[0]["call_id"], "call_a");
+        assert_eq!(output[0]["arguments"], r#"{"city":"Paris"}"#);
+        assert_eq!(output[0]["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_call_after_reasoning_follows_the_documented_event_order() {
+        let mut h = harness(Fake::streaming(vec![
+            Ok(Event::ReasoningDelta("need it".into())),
+            Ok(Event::ToolCall(weather_call("call_a", "Paris"))),
+            Ok(Event::Done {
+                finish: FinishReason::ToolCalls,
+                usage: Usage::default(),
+            }),
+        ]));
+        let (_, body) = h
+            .post_raw("/v1/responses", streaming_responses_body())
+            .await;
+        assert_eq!(
+            sse_events(&body),
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ],
+            "{body}"
+        );
+        let data = sse_data(&body);
+        let completed = data.last().unwrap();
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(data[6]["output_index"], 1);
+        assert_eq!(data[6]["item"]["arguments"], "");
+        assert_eq!(data[7]["delta"], r#"{"city":"Paris"}"#);
+    }
+
+    #[tokio::test]
+    async fn responses_refuses_tools_it_cannot_serve() {
+        responses_refused("tools", json!({"tools": [{"type": "web_search"}]})).await;
         responses_refused("tools", json!({"tools": [{"type": "function"}]})).await;
-        responses_refused("tool_choice", json!({"tool_choice": "auto"})).await;
+        responses_refused(
+            "tool_choice",
+            json!({"tool_choice": {"type": "file_search"}}),
+        )
+        .await;
+        responses_refused(
+            "input",
+            json!({"input": [{"type": "function_call", "call_id": "c", "name": "f", "arguments": "[]"}]}),
+        )
+        .await;
+        responses_refused(
+            "input",
+            json!({"input": [{"type": "function_call_output", "output": "21C"}]}),
+        )
+        .await;
     }
 
     #[tokio::test]

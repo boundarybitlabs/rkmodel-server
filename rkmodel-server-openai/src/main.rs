@@ -7,6 +7,7 @@ mod error;
 mod id;
 mod responses;
 mod routes;
+mod tools;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
