@@ -1,9 +1,10 @@
 # rkmodel-server
 
-The design, and the plan of record. The workspace now exists as a skeleton: the
-protocol, the client, the daemon's config and validation, and the two endpoints
-that need no model worker. Nothing loads weights yet, so no model reports ready.
-[Milestones](#milestones) tracks the rest.
+The design, and the plan of record. Text generation runs end to end on an RK3588
+board: both chat endpoints, streaming and not, against two models loaded at
+once. Transcription is written and tested against a fake daemon, but has not met
+rkwhisperd on hardware yet. Embeddings and images are still ahead.
+[Milestones](#milestones) tracks where each one stands.
 
 `rkmodel-server` runs models on a Rockchip NPU and serves them over TCP.
 `rkmodel-server-openai` puts an OpenAI-compatible HTTP API in front of it, so an
