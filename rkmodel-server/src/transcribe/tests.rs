@@ -206,7 +206,7 @@ fn segments_join_into_one_transcript_without_doubling_spaces() {
             end_s: 2.0,
         },
     ];
-    assert_eq!(joined(&segments), "the sky is blue");
+    assert_eq!(transcript(&segments), "the sky is blue");
 }
 
 #[test]
@@ -223,7 +223,7 @@ fn an_empty_segment_does_not_become_a_stray_space() {
             end_s: 2.0,
         },
     ];
-    assert_eq!(joined(&segments), "hello");
+    assert_eq!(transcript(&segments), "hello");
 }
 
 // ---- driving a session -----------------------------------------------------

@@ -24,6 +24,15 @@ tokio-stream = "0.1"
 async-stream = "0.3"
 futures-core = "0.3"
 axum = "0.7"
+# Multipart uploads, for /v1/audio/transcriptions.
+axum-extra = { version = "0.9", features = ["multipart"] }
+# Decoding the upload's container. The defaults cover flac, ogg/vorbis, wav and
+# mkv/webm; the rest are what OpenAI's documented format list needs. Opus is not
+# among them, since symphonia has no Opus decoder yet.
+symphonia = { version = "0.6", features = ["mpa", "aac", "isomp4", "alac"] }
+# Whisper wants 16 kHz, and uploads are usually 44.1 or 48. 44100 to 16000 is
+# 147/160, so a proper band-limited resampler rather than dropping samples.
+rubato = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

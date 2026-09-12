@@ -142,6 +142,27 @@ pub struct Segment {
     pub end_s: f32,
 }
 
+/// Segment text as one transcript.
+///
+/// rkwhisper emits each segment with its own leading space, so this trims
+/// rather than adding separators of its own. Both the daemon and the frontend
+/// build a transcript this way: the daemon for the unary call, the frontend for
+/// the streaming one it actually uses.
+pub fn transcript(segments: &[Segment]) -> String {
+    let mut text = String::new();
+    for segment in segments {
+        let part = segment.text.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(part);
+    }
+    text
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Output {
     Generated {

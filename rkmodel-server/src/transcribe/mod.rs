@@ -13,7 +13,7 @@ pub mod rkwhisper;
 
 use std::sync::Arc;
 
-use rkmodel_server_protocol::{ByteStream, Error, Event, FinishReason, Segment, Usage};
+use rkmodel_server_protocol::{transcript, ByteStream, Error, Event, FinishReason, Segment, Usage};
 use rkwhisper_client::Response;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -211,27 +211,10 @@ pub async fn collect(
     }
 
     Ok(rkmodel_server_protocol::Output::Transcript {
-        text: joined(&segments),
+        text: transcript(&segments),
         segments,
         audio_s,
     })
-}
-
-/// Segment text as one transcript. rkwhisperd emits each segment with its own
-/// leading space, so this trims rather than adding separators of its own.
-pub fn joined(segments: &[Segment]) -> String {
-    let mut text = String::new();
-    for segment in segments {
-        let part = segment.text.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if !text.is_empty() {
-            text.push(' ');
-        }
-        text.push_str(part);
-    }
-    text
 }
 
 #[cfg(test)]
