@@ -1804,11 +1804,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
 
         let (_, pcm) = h.heard();
-        let samples = pcm.len() as i64 / 2;
-        assert!(
-            (samples - 16_000).abs() < 400,
-            "expected about a second at 16 kHz, got {samples} samples"
-        );
+        // A second in, a second out, two bytes a sample.
+        assert_eq!(pcm.len(), 32_000);
     }
 
     #[tokio::test]

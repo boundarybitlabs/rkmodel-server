@@ -344,11 +344,12 @@ impl Resampling {
             .process_into_buffer(&adapter, &mut out, Some(&indexing))
             .map_err(|e| ProtocolError::InvalidInput(format!("resampling failed: {e}")))?;
 
-        // `partial_len` of zero is the flush, which is silence rather than any
-        // of the recording.
-        if partial_len != Some(0) {
-            self.taken += consumed as u64;
-        }
+        // rubato reports a whole block consumed even for a partial one, since
+        // it reads the rest as silence. Counting that would make the clip look
+        // longer than it is and let the padding through, so a partial block
+        // counts only the frames it was actually given. `Some(0)` is the flush,
+        // which is silence rather than any of the recording.
+        self.taken += partial_len.unwrap_or(consumed) as u64;
 
         let dropped = self.skip.min(produced);
         self.skip -= dropped;

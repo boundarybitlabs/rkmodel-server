@@ -96,13 +96,10 @@ async fn stereo_is_averaged_into_one_channel() {
 async fn a_44100_upload_is_resampled_to_16000() {
     let (out, counted) = pcm(wav(44_100, 1, &sine(44_100, 440.0, 1.0)), "a.wav").await;
 
-    // One second in, one second out, give or take the filter's edges.
-    let expected = 16_000i64;
-    assert!(
-        (out.len() as i64 - expected).abs() < 400,
-        "expected about {expected} samples, got {}",
-        out.len()
-    );
+    // One second in, one second out. Exactly: the resampler pads its last
+    // block, and the length that padding would add is what `Resampling` tracks
+    // its input in order to drop.
+    assert_eq!(out.len(), 16_000);
     assert_eq!(counted, out.len() as u64);
 }
 
@@ -124,12 +121,7 @@ async fn resampling_keeps_the_tone_rather_than_aliasing_it() {
 async fn a_48000_upload_is_resampled_to_16000() {
     let (out, _) = pcm(wav(48_000, 1, &sine(48_000, 440.0, 0.5)), "a.wav").await;
 
-    let expected = 8_000i64;
-    assert!(
-        (out.len() as i64 - expected).abs() < 400,
-        "expected about {expected} samples, got {}",
-        out.len()
-    );
+    assert_eq!(out.len(), 8_000);
 }
 
 #[tokio::test]
