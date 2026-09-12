@@ -44,6 +44,8 @@ pub enum Role {
     System,
     User,
     Assistant,
+    /// A function's result, answering a [`ToolCall`] by its id.
+    Tool,
 }
 
 /// Decoded by the frontend. The daemon resizes and normalizes for its encoder.
@@ -64,15 +66,60 @@ pub enum Part {
 pub struct Message {
     pub role: Role,
     pub parts: Vec<Part>,
+    /// Earlier reasoning. Templates render it on assistant turns inside a tool
+    /// loop, and drop it from turns before the last user message.
+    pub reasoning: Option<String>,
+    /// The calls an assistant turn made.
+    pub tool_calls: Vec<ToolCall>,
+    /// On a tool turn, the call this answers.
+    pub tool_call_id: Option<String>,
 }
 
 impl Message {
-    pub fn text(role: Role, text: impl Into<String>) -> Self {
+    pub fn new(role: Role, parts: Vec<Part>) -> Self {
         Message {
             role,
-            parts: vec![Part::Text(text.into())],
+            parts,
+            reasoning: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
+
+    pub fn text(role: Role, text: impl Into<String>) -> Self {
+        Message::new(role, vec![Part::Text(text.into())])
+    }
+}
+
+/// A function the model may call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tool {
+    pub name: String,
+    pub description: Option<String>,
+    /// A JSON Schema, kept as text. It is arbitrary, and only a template reads
+    /// it.
+    pub parameters_json: Option<String>,
+}
+
+/// A call the model made, or made in an earlier turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    /// A JSON object.
+    pub arguments_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolChoice {
+    /// Tools are not offered this turn.
+    None,
+    /// The model decides.
+    Auto,
+    /// The model must call one of the tools.
+    Required,
+    /// The model must call this one.
+    Function(String),
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -83,6 +130,11 @@ pub struct GenerateInput {
     pub max_tokens: Option<u32>,
     /// `None` takes the model's configured default.
     pub reasoning: Option<bool>,
+    pub tools: Vec<Tool>,
+    /// `None` is `Auto` when there are tools.
+    pub tool_choice: Option<ToolChoice>,
+    /// `None` is true, as it is for OpenAI.
+    pub parallel_tool_calls: Option<bool>,
 }
 
 /// Audio arrives as later messages on the same call, not as a field, so this
@@ -126,6 +178,8 @@ impl Input {
 pub enum FinishReason {
     Stop,
     Length,
+    /// The model called at least one tool.
+    ToolCalls,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -168,6 +222,7 @@ pub enum Output {
     Generated {
         text: String,
         reasoning: Option<String>,
+        tool_calls: Vec<ToolCall>,
         finish: FinishReason,
         usage: Usage,
     },
@@ -186,8 +241,14 @@ pub enum Output {
 pub enum Event {
     ReasoningDelta(String),
     TextDelta(String),
+    /// Sent whole, once the call has parsed. Arguments are not streamed as
+    /// they are generated.
+    ToolCall(ToolCall),
     Segment(Segment),
-    Done { finish: FinishReason, usage: Usage },
+    Done {
+        finish: FinishReason,
+        usage: Usage,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +286,8 @@ pub struct ModelInfo {
     /// frontend downsizes to it, which keeps image payloads small.
     pub image_input: Option<(u32, u32)>,
     pub reasoning: bool,
+    /// Whether the model accepts tools.
+    pub tools: bool,
 }
 
 impl ModelInfo {

@@ -213,7 +213,7 @@ pub async fn collect(
         match event? {
             Event::Segment(s) => segments.push(s),
             Event::Done { .. } => done = true,
-            Event::TextDelta(_) | Event::ReasoningDelta(_) => {}
+            Event::TextDelta(_) | Event::ReasoningDelta(_) | Event::ToolCall(_) => {}
         }
     }
     drop(handle);

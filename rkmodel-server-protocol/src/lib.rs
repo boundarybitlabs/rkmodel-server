@@ -22,7 +22,10 @@ pub use types::*;
 
 /// The protocol version carried on every request. The major version also sits
 /// in the proto package name, so a mismatch there fails at the route instead.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2 added tools. A frontend at 1 would drop a tool call it cannot decode, so
+/// the daemon refuses it rather than let tool calls vanish.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 use std::pin::Pin;
 

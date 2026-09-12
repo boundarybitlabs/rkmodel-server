@@ -8,11 +8,40 @@ enum Operation {
   OPERATION_TRANSCRIBE  = 3;
 }
 
-enum Role { ROLE_UNSPECIFIED = 0; ROLE_SYSTEM = 1; ROLE_USER = 2; ROLE_ASSISTANT = 3; }
+enum Role { ROLE_UNSPECIFIED = 0; ROLE_SYSTEM = 1; ROLE_USER = 2; ROLE_ASSISTANT = 3; ROLE_TOOL = 4; }
 
 message Image { uint32 width = 1; uint32 height = 2; bytes rgb8 = 3; }
 message Part { oneof part { string text = 1; Image image = 2; } }
-message Message { Role role = 1; repeated Part parts = 2; }
+
+// A function the model may call. The schema stays JSON text, since it is
+// arbitrary and only a template reads it.
+message Tool {
+  string name = 1;
+  optional string description = 2;
+  optional string parameters_json = 3;
+}
+message ToolCall { string id = 1; string name = 2; string arguments_json = 3; }
+
+enum ToolChoiceMode {
+  TOOL_CHOICE_MODE_UNSPECIFIED = 0;
+  TOOL_CHOICE_MODE_NONE = 1;
+  TOOL_CHOICE_MODE_AUTO = 2;
+  TOOL_CHOICE_MODE_REQUIRED = 3;
+  TOOL_CHOICE_MODE_FUNCTION = 4;
+}
+// `function` names the function when the mode is FUNCTION, and is empty otherwise.
+message ToolChoice { ToolChoiceMode mode = 1; string function = 2; }
+
+message Message {
+  Role role = 1;
+  repeated Part parts = 2;
+  // Earlier reasoning, which templates render inside a tool loop.
+  optional string reasoning = 3;
+  // On assistant turns.
+  repeated ToolCall tool_calls = 4;
+  // On tool turns.
+  optional string tool_call_id = 5;
+}
 
 message GenerateInput {
   repeated Message messages = 1;
@@ -20,6 +49,9 @@ message GenerateInput {
   optional float top_p = 3;
   optional uint32 max_tokens = 4;
   optional bool reasoning = 5;
+  repeated Tool tools = 6;
+  optional ToolChoice tool_choice = 7;
+  optional bool parallel_tool_calls = 8;
 }
 message EmbedInput { string text = 1; }
 message TranscribeInput { bytes pcm_s16le = 1; optional string language = 2; }
@@ -39,11 +71,17 @@ message InvokeRequest {
   repeated Input inputs = 4;
 }
 
-enum FinishReason { FINISH_REASON_UNSPECIFIED = 0; FINISH_REASON_STOP = 1; FINISH_REASON_LENGTH = 2; }
+enum FinishReason { FINISH_REASON_UNSPECIFIED = 0; FINISH_REASON_STOP = 1; FINISH_REASON_LENGTH = 2; FINISH_REASON_TOOL_CALLS = 3; }
 message Usage { uint32 input_tokens = 1; uint32 output_tokens = 2; uint32 reasoning_tokens = 3; }
 message Segment { string text = 1; float start_s = 2; float end_s = 3; }
 
-message Generated { string text = 1; optional string reasoning = 2; FinishReason finish = 3; Usage usage = 4; }
+message Generated {
+  string text = 1;
+  optional string reasoning = 2;
+  FinishReason finish = 3;
+  Usage usage = 4;
+  repeated ToolCall tool_calls = 5;
+}
 message Embedding { repeated float vector = 1; uint32 tokens = 2; }
 message Transcript { string text = 1; repeated Segment segments = 2; float audio_s = 3; }
 
@@ -57,6 +95,8 @@ message Event {
     string text_delta = 2;
     Segment segment = 3;
     Done done = 4;
+    // Sent whole, once the call has parsed.
+    ToolCall tool_call = 5;
   }
 }
 
@@ -83,6 +123,8 @@ message ModelInfo {
   uint64 loaded_at = 5;
   optional ImageInputSize image_input = 6;
   bool reasoning = 7;
+  // Whether the model has a tool_format, and so accepts tools.
+  bool tools = 8;
 }
 message ModelsRequest {}
 message ModelsResponse { repeated ModelInfo models = 1; }

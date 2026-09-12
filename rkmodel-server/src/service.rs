@@ -84,12 +84,14 @@ impl Service {
 
         let mut text = String::new();
         let mut reasoning = String::new();
+        let mut tool_calls = Vec::new();
         let mut done = None;
 
         while let Some(event) = rx.recv().await {
             match event? {
                 Event::TextDelta(s) => text.push_str(&s),
                 Event::ReasoningDelta(s) => reasoning.push_str(&s),
+                Event::ToolCall(c) => tool_calls.push(c),
                 Event::Done { finish, usage } => done = Some((finish, usage)),
                 Event::Segment(_) => {}
             }
@@ -104,6 +106,7 @@ impl Service {
         Ok(Output::Generated {
             text,
             reasoning: (!reasoning.is_empty()).then_some(reasoning),
+            tool_calls,
             finish,
             usage,
         })
@@ -405,14 +408,23 @@ mod tests {
 
     #[test]
     fn the_supported_protocol_version_passes() {
-        assert!(Service::check_version(1).is_ok());
+        assert!(Service::check_version(PROTOCOL_VERSION).is_ok());
     }
 
     #[test]
     fn another_protocol_version_is_refused_naming_both() {
         let err = Service::check_version(99).unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("99") && message.contains('1'), "{message}");
+        assert!(
+            message.contains("99") && message.contains(&PROTOCOL_VERSION.to_string()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_frontend_from_before_tools_is_refused() {
+        // It would drop a tool call it cannot decode rather than fail.
+        assert!(Service::check_version(1).is_err());
     }
 
     #[test]
@@ -454,9 +466,11 @@ mod tests {
             Output::Generated {
                 text,
                 reasoning,
+                tool_calls,
                 finish,
                 usage,
             } => {
+                assert!(tool_calls.is_empty());
                 assert_eq!(text, "the sky is blue");
                 assert_eq!(reasoning, None);
                 assert_eq!(finish, rkmodel_server_protocol::FinishReason::Stop);

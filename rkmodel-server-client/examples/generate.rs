@@ -100,6 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         top_p: None,
         max_tokens: args.max_tokens,
         reasoning: args.reasoning,
+        ..Default::default()
     });
 
     let started = Instant::now();
@@ -111,12 +112,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Output::Generated {
                 text,
                 reasoning,
+                tool_calls,
                 finish,
                 usage,
             } = output
             {
                 if let Some(r) = reasoning {
                     println!("[reasoning] {r}");
+                }
+                for call in tool_calls {
+                    println!(
+                        "[tool call {}] {}({})",
+                        call.id, call.name, call.arguments_json
+                    );
                 }
                 println!("{text}");
                 println!("\n[{finish:?}] {usage:?} in {:?}", started.elapsed());
@@ -150,6 +158,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 first_token.get_or_insert_with(|| started.elapsed());
                 print!("{s}");
                 flush();
+            }
+            Event::ToolCall(call) => {
+                if in_reasoning {
+                    println!();
+                    in_reasoning = false;
+                }
+                first_token.get_or_insert_with(|| started.elapsed());
+                println!(
+                    "\n[tool call {}] {}({})",
+                    call.id, call.name, call.arguments_json
+                );
             }
             Event::Segment(_) => {}
             Event::Done { finish, usage } => {

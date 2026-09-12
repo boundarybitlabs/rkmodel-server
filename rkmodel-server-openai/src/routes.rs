@@ -160,6 +160,7 @@ async fn chat_completions(
             reasoning,
             finish,
             usage,
+            ..
         }) = outputs.into_iter().next()
         else {
             return Err(ApiError::upstream("The daemon returned no generation."));
@@ -200,7 +201,8 @@ async fn chat_completions(
                     yield data(chat::chunk_json(&id, created, &model, json!({"content": s}), None));
                 }
                 Ok(Event::Done { finish, usage }) => done = Some((finish, usage)),
-                Ok(Event::Segment(_)) => {}
+                // Tools are still refused at validation, so no call can arrive.
+                Ok(Event::Segment(_)) | Ok(Event::ToolCall(_)) => {}
                 Err(e) => {
                     yield data(ApiError::from(e).as_error_body());
                     return;
@@ -257,6 +259,7 @@ async fn responses_endpoint(
             reasoning,
             finish,
             usage,
+            ..
         }) = outputs.into_iter().next()
         else {
             return Err(ApiError::upstream("The daemon returned no generation."));
@@ -361,7 +364,8 @@ async fn responses_endpoint(
                     }));
                 }
                 Ok(Event::Done { finish, usage }) => done = Some((finish, usage)),
-                Ok(Event::Segment(_)) => {}
+                // Tools are still refused at validation, so no call can arrive.
+                Ok(Event::Segment(_)) | Ok(Event::ToolCall(_)) => {}
                 Err(e) => {
                     failed = Some(ApiError::from(e));
                     break;
@@ -491,7 +495,7 @@ async fn transcriptions(
         match event? {
             Event::Segment(segment) => segments.push(segment),
             Event::Done { .. } => done = true,
-            Event::TextDelta(_) | Event::ReasoningDelta(_) => {}
+            Event::TextDelta(_) | Event::ReasoningDelta(_) | Event::ToolCall(_) => {}
         }
     }
     if !done {
@@ -568,6 +572,7 @@ mod tests {
                 outputs: vec![Output::Generated {
                     text: text.into(),
                     reasoning: reasoning.map(Into::into),
+                    tool_calls: vec![],
                     finish: FinishReason::Stop,
                     usage: Usage {
                         input_tokens: 24,
@@ -653,6 +658,7 @@ mod tests {
             loaded_at: 1757548800,
             image_input: None,
             reasoning: false,
+            tools: false,
         }
     }
 
@@ -908,6 +914,7 @@ mod tests {
             outputs: vec![Output::Generated {
                 text: "cut off".into(),
                 reasoning: None,
+                tool_calls: vec![],
                 finish: FinishReason::Length,
                 usage: Usage::default(),
             }],
@@ -1356,6 +1363,7 @@ mod tests {
             outputs: vec![Output::Generated {
                 text: "cut off".into(),
                 reasoning: None,
+                tool_calls: vec![],
                 finish: FinishReason::Length,
                 usage: Usage::default(),
             }],

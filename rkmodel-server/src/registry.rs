@@ -41,6 +41,7 @@ impl Registry {
                 loaded_at: 0,
                 image_input: None,
                 reasoning: m.reasoning.is_some(),
+                tools: m.tool_format.is_some(),
             });
         }
         Ok(Registry {

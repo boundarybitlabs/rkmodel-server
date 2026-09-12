@@ -152,6 +152,7 @@ impl ChatRequest {
             top_p: self.top_p,
             max_tokens: budget,
             reasoning,
+            ..Default::default()
         })
     }
 }
@@ -198,7 +199,7 @@ impl ChatMessage {
             }
         };
 
-        Ok(Message { role, parts })
+        Ok(Message::new(role, parts))
     }
 }
 
@@ -206,6 +207,7 @@ pub fn finish_str(finish: FinishReason) -> &'static str {
     match finish {
         FinishReason::Stop => "stop",
         FinishReason::Length => "length",
+        FinishReason::ToolCalls => "tool_calls",
     }
 }
 

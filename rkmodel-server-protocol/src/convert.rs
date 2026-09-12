@@ -45,6 +45,7 @@ impl From<Role> for pb::Role {
             Role::System => pb::Role::System,
             Role::User => pb::Role::User,
             Role::Assistant => pb::Role::Assistant,
+            Role::Tool => pb::Role::Tool,
         }
     }
 }
@@ -54,6 +55,7 @@ fn role_from_i32(v: i32) -> Result<Role, Error> {
         Ok(pb::Role::System) => Ok(Role::System),
         Ok(pb::Role::User) => Ok(Role::User),
         Ok(pb::Role::Assistant) => Ok(Role::Assistant),
+        Ok(pb::Role::Tool) => Ok(Role::Tool),
         Ok(pb::Role::Unspecified) | Err(_) => Err(Error::InvalidInput(format!("unknown role {v}"))),
     }
 }
@@ -63,6 +65,7 @@ impl From<FinishReason> for pb::FinishReason {
         match f {
             FinishReason::Stop => pb::FinishReason::Stop,
             FinishReason::Length => pb::FinishReason::Length,
+            FinishReason::ToolCalls => pb::FinishReason::ToolCalls,
         }
     }
 }
@@ -71,6 +74,7 @@ fn finish_from_i32(v: i32) -> Result<FinishReason, Error> {
     match pb::FinishReason::try_from(v) {
         Ok(pb::FinishReason::Stop) => Ok(FinishReason::Stop),
         Ok(pb::FinishReason::Length) => Ok(FinishReason::Length),
+        Ok(pb::FinishReason::ToolCalls) => Ok(FinishReason::ToolCalls),
         Ok(pb::FinishReason::Unspecified) | Err(_) => {
             Err(Error::InvalidInput(format!("unknown finish reason {v}")))
         }
@@ -139,6 +143,82 @@ impl From<pb::Image> for Image {
     }
 }
 
+impl From<Tool> for pb::Tool {
+    fn from(t: Tool) -> Self {
+        pb::Tool {
+            name: t.name,
+            description: t.description,
+            parameters_json: t.parameters_json,
+        }
+    }
+}
+
+impl From<pb::Tool> for Tool {
+    fn from(t: pb::Tool) -> Self {
+        Tool {
+            name: t.name,
+            description: t.description,
+            parameters_json: t.parameters_json,
+        }
+    }
+}
+
+impl From<ToolCall> for pb::ToolCall {
+    fn from(c: ToolCall) -> Self {
+        pb::ToolCall {
+            id: c.id,
+            name: c.name,
+            arguments_json: c.arguments_json,
+        }
+    }
+}
+
+impl From<pb::ToolCall> for ToolCall {
+    fn from(c: pb::ToolCall) -> Self {
+        ToolCall {
+            id: c.id,
+            name: c.name,
+            arguments_json: c.arguments_json,
+        }
+    }
+}
+
+impl From<ToolChoice> for pb::ToolChoice {
+    fn from(c: ToolChoice) -> Self {
+        let (mode, function) = match c {
+            ToolChoice::None => (pb::ToolChoiceMode::None, String::new()),
+            ToolChoice::Auto => (pb::ToolChoiceMode::Auto, String::new()),
+            ToolChoice::Required => (pb::ToolChoiceMode::Required, String::new()),
+            ToolChoice::Function(name) => (pb::ToolChoiceMode::Function, name),
+        };
+        pb::ToolChoice {
+            mode: mode as i32,
+            function,
+        }
+    }
+}
+
+impl TryFrom<pb::ToolChoice> for ToolChoice {
+    type Error = Error;
+    fn try_from(c: pb::ToolChoice) -> Result<Self, Error> {
+        match pb::ToolChoiceMode::try_from(c.mode) {
+            Ok(pb::ToolChoiceMode::None) => Ok(ToolChoice::None),
+            Ok(pb::ToolChoiceMode::Auto) => Ok(ToolChoice::Auto),
+            Ok(pb::ToolChoiceMode::Required) => Ok(ToolChoice::Required),
+            Ok(pb::ToolChoiceMode::Function) if !c.function.is_empty() => {
+                Ok(ToolChoice::Function(c.function))
+            }
+            Ok(pb::ToolChoiceMode::Function) => {
+                Err(Error::InvalidInput("tool choice names no function".into()))
+            }
+            Ok(pb::ToolChoiceMode::Unspecified) | Err(_) => Err(Error::InvalidInput(format!(
+                "unknown tool choice mode {}",
+                c.mode
+            ))),
+        }
+    }
+}
+
 // ---- messages -------------------------------------------------------------
 
 impl From<Part> for pb::Part {
@@ -168,6 +248,9 @@ impl From<Message> for pb::Message {
         pb::Message {
             role: pb::Role::from(m.role) as i32,
             parts: m.parts.into_iter().map(Into::into).collect(),
+            reasoning: m.reasoning,
+            tool_calls: m.tool_calls.into_iter().map(Into::into).collect(),
+            tool_call_id: m.tool_call_id,
         }
     }
 }
@@ -182,6 +265,9 @@ impl TryFrom<pb::Message> for Message {
                 .into_iter()
                 .map(Part::try_from)
                 .collect::<Result<_, _>>()?,
+            reasoning: m.reasoning,
+            tool_calls: m.tool_calls.into_iter().map(Into::into).collect(),
+            tool_call_id: m.tool_call_id,
         })
     }
 }
@@ -194,6 +280,9 @@ impl From<GenerateInput> for pb::GenerateInput {
             top_p: g.top_p,
             max_tokens: g.max_tokens,
             reasoning: g.reasoning,
+            tools: g.tools.into_iter().map(Into::into).collect(),
+            tool_choice: g.tool_choice.map(Into::into),
+            parallel_tool_calls: g.parallel_tool_calls,
         }
     }
 }
@@ -211,6 +300,9 @@ impl TryFrom<pb::GenerateInput> for GenerateInput {
             top_p: g.top_p,
             max_tokens: g.max_tokens,
             reasoning: g.reasoning,
+            tools: g.tools.into_iter().map(Into::into).collect(),
+            tool_choice: g.tool_choice.map(ToolChoice::try_from).transpose()?,
+            parallel_tool_calls: g.parallel_tool_calls,
         })
     }
 }
@@ -283,6 +375,7 @@ impl From<Output> for pb::Output {
                 Output::Generated {
                     text,
                     reasoning,
+                    tool_calls,
                     finish,
                     usage,
                 } => pb::output::Output::Generated(pb::Generated {
@@ -290,6 +383,7 @@ impl From<Output> for pb::Output {
                     reasoning,
                     finish: pb::FinishReason::from(finish) as i32,
                     usage: Some(usage.into()),
+                    tool_calls: tool_calls.into_iter().map(Into::into).collect(),
                 }),
                 Output::Embedding { vector, tokens } => {
                     pb::output::Output::Embedding(pb::Embedding { vector, tokens })
@@ -315,6 +409,7 @@ impl TryFrom<pb::Output> for Output {
             Some(pb::output::Output::Generated(g)) => Ok(Output::Generated {
                 text: g.text,
                 reasoning: g.reasoning,
+                tool_calls: g.tool_calls.into_iter().map(Into::into).collect(),
                 finish: finish_from_i32(g.finish)?,
                 usage: g.usage.unwrap_or_default().into(),
             }),
@@ -338,6 +433,7 @@ impl From<Event> for pb::Event {
             event: Some(match e {
                 Event::ReasoningDelta(s) => pb::event::Event::ReasoningDelta(s),
                 Event::TextDelta(s) => pb::event::Event::TextDelta(s),
+                Event::ToolCall(c) => pb::event::Event::ToolCall(c.into()),
                 Event::Segment(s) => pb::event::Event::Segment(s.into()),
                 Event::Done { finish, usage } => pb::event::Event::Done(pb::Done {
                     finish: pb::FinishReason::from(finish) as i32,
@@ -354,6 +450,7 @@ impl TryFrom<pb::Event> for Event {
         match e.event {
             Some(pb::event::Event::ReasoningDelta(s)) => Ok(Event::ReasoningDelta(s)),
             Some(pb::event::Event::TextDelta(s)) => Ok(Event::TextDelta(s)),
+            Some(pb::event::Event::ToolCall(c)) => Ok(Event::ToolCall(c.into())),
             Some(pb::event::Event::Segment(s)) => Ok(Event::Segment(s.into())),
             Some(pb::event::Event::Done(d)) => Ok(Event::Done {
                 finish: finish_from_i32(d.finish)?,
@@ -388,6 +485,7 @@ impl From<ModelInfo> for pb::ModelInfo {
                 .image_input
                 .map(|(width, height)| pb::ImageInputSize { width, height }),
             reasoning: m.reasoning,
+            tools: m.tools,
         }
     }
 }
@@ -418,6 +516,93 @@ impl TryFrom<pb::ModelInfo> for ModelInfo {
             loaded_at: m.loaded_at,
             image_input: m.image_input.map(|s| (s.width, s.height)),
             reasoning: m.reasoning,
+            tools: m.tools,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call() -> ToolCall {
+        ToolCall {
+            id: "call_1".into(),
+            name: "get_weather".into(),
+            arguments_json: r#"{"city": "Paris"}"#.into(),
+        }
+    }
+
+    #[test]
+    fn a_tool_loop_survives_the_wire() {
+        let input = GenerateInput {
+            messages: vec![
+                Message::text(Role::User, "Weather in Paris?"),
+                Message {
+                    reasoning: Some("need the tool".into()),
+                    tool_calls: vec![call()],
+                    ..Message::new(Role::Assistant, vec![])
+                },
+                Message {
+                    tool_call_id: Some("call_1".into()),
+                    ..Message::text(Role::Tool, r#"{"temp": 21}"#)
+                },
+            ],
+            tools: vec![Tool {
+                name: "get_weather".into(),
+                description: Some("Current weather".into()),
+                parameters_json: Some(r#"{"type": "object"}"#.into()),
+            }],
+            tool_choice: Some(ToolChoice::Function("get_weather".into())),
+            parallel_tool_calls: Some(false),
+            ..Default::default()
+        };
+        let back = GenerateInput::try_from(pb::GenerateInput::from(input.clone())).unwrap();
+        assert_eq!(back, input);
+    }
+
+    #[test]
+    fn every_tool_choice_survives_the_wire() {
+        for choice in [
+            ToolChoice::None,
+            ToolChoice::Auto,
+            ToolChoice::Required,
+            ToolChoice::Function("f".into()),
+        ] {
+            let back = ToolChoice::try_from(pb::ToolChoice::from(choice.clone())).unwrap();
+            assert_eq!(back, choice);
+        }
+    }
+
+    #[test]
+    fn a_function_choice_without_a_name_is_refused() {
+        let empty = pb::ToolChoice {
+            mode: pb::ToolChoiceMode::Function as i32,
+            function: String::new(),
+        };
+        assert!(ToolChoice::try_from(empty).is_err());
+        let unset = pb::ToolChoice::default();
+        assert!(ToolChoice::try_from(unset).is_err());
+    }
+
+    #[test]
+    fn calls_survive_as_events_and_outputs() {
+        let event = Event::ToolCall(call());
+        assert_eq!(
+            Event::try_from(pb::Event::from(event.clone())).unwrap(),
+            event
+        );
+
+        let output = Output::Generated {
+            text: String::new(),
+            reasoning: None,
+            tool_calls: vec![call()],
+            finish: FinishReason::ToolCalls,
+            usage: Usage::default(),
+        };
+        assert_eq!(
+            Output::try_from(pb::Output::from(output.clone())).unwrap(),
+            output
+        );
     }
 }

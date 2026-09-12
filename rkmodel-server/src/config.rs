@@ -55,6 +55,8 @@ pub struct ModelConfig {
     pub rkllm: Option<PathBuf>,
     pub chat_template: Option<PathBuf>,
     pub reasoning: Option<Reasoning>,
+    /// How the model writes a tool call. A model without one refuses tools.
+    pub tool_format: Option<ToolFormat>,
     pub max_context_len: Option<u32>,
     pub max_new_tokens: Option<u32>,
     #[serde(default)]
@@ -90,6 +92,16 @@ pub struct Reasoning {
     pub end: String,
     #[serde(default)]
     pub default: bool,
+}
+
+/// A model family's tool-call syntax, which decides the parser and the markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolFormat {
+    /// Qwen2.5 and Qwen3: `<tool_call>{"name": …, "arguments": …}</tool_call>`.
+    Hermes,
+    /// Gemma 4: `<|tool_call>call:name{key:<|"|>value<|"|>}<tool_call|>`.
+    Gemma4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -192,6 +204,12 @@ impl ModelConfig {
         let ops = self.operations()?;
         if ops.is_empty() {
             bail!("model {}: no operations listed", self.id);
+        }
+        if self.tool_format.is_some() && !ops.contains(&Operation::Generate) {
+            bail!(
+                "model {}: `tool_format` needs the generate operation",
+                self.id
+            );
         }
         if self.embed_flash.is_some() && self.backend != Backend::Rkllm {
             bail!(
@@ -387,6 +405,37 @@ mod tests {
         .unwrap();
         assert_eq!(c.models[0].sampling.temperature, 0.2);
         assert_eq!(c.models[0].sampling.top_k, Sampling::default().top_k);
+    }
+
+    #[test]
+    fn tool_format_parses_and_needs_generate() {
+        let c = parse(
+            r#"
+            [[models]]
+            id = "gemma-4-e2b"
+            operations = ["generate"]
+            backend = "rkllm"
+            rkllm = "/x.rkllm"
+            tool_format = "gemma4"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.models[0].tool_format, Some(ToolFormat::Gemma4));
+
+        let err = parse(
+            r#"
+            [[models]]
+            id = "bge"
+            operations = ["embed"]
+            backend = "rknn"
+            rknn = "/m.rknn"
+            tokenizer = "/t.json"
+            tool_format = "hermes"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("tool_format"), "{err}");
     }
 
     #[test]

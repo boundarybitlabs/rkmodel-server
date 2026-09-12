@@ -82,6 +82,7 @@ fn role_str(role: Role) -> &'static str {
         Role::System => "system",
         Role::User => "user",
         Role::Assistant => "assistant",
+        Role::Tool => "tool",
     }
 }
 
@@ -463,19 +464,19 @@ mod tests {
 
     #[test]
     fn several_parts_join_into_one_content_string() {
-        let messages = vec![Message {
-            role: Role::User,
-            parts: vec![Part::Text("one ".into()), Part::Text("two".into())],
-        }];
+        let messages = vec![Message::new(
+            Role::User,
+            vec![Part::Text("one ".into()), Part::Text("two".into())],
+        )];
         let got = qwen3().render(&messages, true).unwrap();
         assert!(got.contains("user\none two<|im_end|>"), "{got:?}");
     }
 
     #[test]
     fn an_image_part_leaves_a_placeholder() {
-        let messages = vec![Message {
-            role: Role::User,
-            parts: vec![
+        let messages = vec![Message::new(
+            Role::User,
+            vec![
                 Part::Image(rkmodel_server_protocol::Image {
                     width: 2,
                     height: 2,
@@ -483,7 +484,7 @@ mod tests {
                 }),
                 Part::Text(" describe it".into()),
             ],
-        }];
+        )];
         let got = qwen3().render(&messages, true).unwrap();
         assert!(got.contains("user\n<image> describe it"), "{got:?}");
     }

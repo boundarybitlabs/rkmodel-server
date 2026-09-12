@@ -135,6 +135,7 @@ impl ResponsesRequest {
             top_p: self.top_p,
             max_tokens: self.max_output_tokens,
             reasoning,
+            ..Default::default()
         })
     }
 }
@@ -198,7 +199,7 @@ impl InputItem {
             }
         };
 
-        Ok(Some(Message { role, parts }))
+        Ok(Some(Message::new(role, parts)))
     }
 }
 
@@ -282,7 +283,8 @@ pub fn response_json(
 
 pub fn status_for(finish: FinishReason) -> &'static str {
     match finish {
-        FinishReason::Stop => "completed",
+        // A response that ends in calls is complete. The client answers them.
+        FinishReason::Stop | FinishReason::ToolCalls => "completed",
         FinishReason::Length => "incomplete",
     }
 }
@@ -290,7 +292,7 @@ pub fn status_for(finish: FinishReason) -> &'static str {
 /// The terminal event name matching a finish reason.
 pub fn terminal_event(finish: FinishReason) -> &'static str {
     match finish {
-        FinishReason::Stop => "response.completed",
+        FinishReason::Stop | FinishReason::ToolCalls => "response.completed",
         FinishReason::Length => "response.incomplete",
     }
 }

@@ -192,7 +192,7 @@ enum Part { Text(String), Image(Image) }
 
 /// A function the model may call. The schema stays JSON text, since it is
 /// arbitrary and only a template reads it.
-struct Tool { name: String, description: String, parameters_json: String }
+struct Tool { name: String, description: Option<String>, parameters_json: Option<String> }
 struct ToolCall { id: String, name: String, arguments_json: String }
 enum ToolChoice { None, Auto, Required, Function(String) }
 
@@ -1301,7 +1301,7 @@ Specified in [Tool calls](#tool-calls) and
 Almost all of it tests off the board, since it is templates, parsers and
 adapters, and it adds no hardware path.
 
-- [ ] Protocol: `Role::Tool`, `Tool`, `ToolCall`, `ToolChoice`, the tool fields
+- [x] Protocol: `Role::Tool`, `Tool`, `ToolCall`, `ToolChoice`, the tool fields
       of `Message` and `GenerateInput`, `Event::ToolCall`,
       `FinishReason::ToolCalls`, `ModelInfo::tools`, and a new minor
       `protocol_version`
