@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use rkmodel_server_protocol::convert::{operation_from_i32, DecodedInput};
 use rkmodel_server_protocol::{
-    pb, Error, Event, GenerateInput, Operation, Output, PROTOCOL_VERSION,
+    pb, ByteStream, Error, Event, GenerateInput, Operation, Output, PROTOCOL_VERSION,
 };
 use tokio::sync::mpsc;
 
@@ -19,15 +19,34 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::generate::sampling;
 use crate::models::{LoadedGenerate, Models};
 use crate::registry::Registry;
+use crate::transcribe::{self, Asr};
+
+/// Bytes per sample of 16 kHz mono s16le, which is the only format the
+/// transcribe path carries.
+const BYTES_PER_SAMPLE: usize = 2;
+const SAMPLE_RATE: f32 = 16_000.0;
 
 pub struct Service {
     registry: Arc<Registry>,
     models: Arc<Models>,
+    /// `None` when no `rkwhisper_socket` is configured, which is every
+    /// deployment that serves no transcribe model.
+    asr: Option<Arc<dyn Asr>>,
 }
 
 impl Service {
-    pub fn new(registry: Arc<Registry>, models: Arc<Models>) -> Self {
-        Service { registry, models }
+    pub fn new(registry: Arc<Registry>, models: Arc<Models>, asr: Option<Arc<dyn Asr>>) -> Self {
+        Service {
+            registry,
+            models,
+            asr,
+        }
+    }
+
+    fn asr(&self) -> Result<Arc<dyn Asr>, Error> {
+        self.asr
+            .clone()
+            .ok_or_else(|| Error::Unavailable("no rkwhisper socket is configured".into()))
     }
 
     /// Everything between a validated request and a queued run: render the
@@ -89,6 +108,23 @@ impl Service {
         })
     }
 
+    /// Transcribes one clip that arrived whole, for the unary call.
+    ///
+    /// The streaming call is the one the frontend uses, since audio should
+    /// reach rkwhisperd while the upload is still arriving. This exists so
+    /// `invoke` answers transcribe rather than refusing it.
+    async fn transcribe_once(
+        &self,
+        model: &str,
+        language: Option<String>,
+        pcm: Vec<u8>,
+    ) -> Result<Output, Error> {
+        let audio_s = pcm.len() as f32 / BYTES_PER_SAMPLE as f32 / SAMPLE_RATE;
+        let audio: ByteStream = Box::pin(tokio_stream::once(Ok(pcm)));
+        let (rx, handle) = transcribe::start(self.asr()?, model, language, audio).await?;
+        transcribe::collect(rx, handle, audio_s).await
+    }
+
     fn check_version(sent: u32) -> Result<(), Error> {
         if sent == PROTOCOL_VERSION {
             Ok(())
@@ -121,11 +157,59 @@ impl Service {
         if operation == Operation::Generate && self.models.get_generate(model).is_none() {
             return Err(Error::Unavailable(format!("{model} is not loaded")));
         }
+        if operation == Operation::Transcribe {
+            self.asr()?;
+        }
         Ok(())
     }
 }
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<pb::Event, Status>> + Send>>;
+
+/// Whatever keeps a streaming request alive, held only to be dropped.
+///
+/// Generate and transcribe cancel through different types, and both do it in
+/// `Drop`, so the stream needs nothing from this but to own it.
+type Cancel = Box<dyn Send + 'static>;
+
+/// The audio on a transcribe call: the first message's chunk, then the rest of
+/// the messages as they arrive.
+///
+/// Later messages carry only PCM. Their `operation` and `model` are ignored,
+/// since the first message settled both.
+fn audio_stream(first: Vec<u8>, mut inbound: Streaming<pb::StreamRequest>) -> ByteStream {
+    Box::pin(async_stream::stream! {
+        if !first.is_empty() {
+            yield Ok(first);
+        }
+        while let Some(message) = inbound.next().await {
+            let message = match message {
+                Ok(m) => m,
+                Err(status) => {
+                    yield Err(Error::from(status));
+                    return;
+                }
+            };
+            match message.input.and_then(|i| i.input) {
+                Some(pb::input::Input::Transcribe(t)) => {
+                    if !t.pcm_s16le.is_empty() {
+                        yield Ok(t.pcm_s16le);
+                    }
+                }
+                Some(_) => {
+                    yield Err(Error::InvalidInput(
+                        "a later message on a transcribe call carried something other than audio"
+                            .into(),
+                    ));
+                    return;
+                }
+                // Nothing to forward. The stream ending is what says the upload
+                // is over, so an empty message is simply skipped.
+                None => {}
+            }
+        }
+    })
+}
 
 #[tonic::async_trait]
 impl pb::rk_model_server_server::RkModelServer for Service {
@@ -152,6 +236,13 @@ impl pb::rk_model_server_server::RkModelServer for Service {
         for one in decoded {
             let output = match one {
                 DecodedInput::Generate(g) => self.generate_once(&req.model, g).await?,
+                DecodedInput::Transcribe {
+                    language,
+                    first_chunk,
+                } => self
+                    .transcribe_once(&req.model, language, first_chunk)
+                    .await
+                    .map_err(Status::from)?,
                 other => {
                     return Err(Status::unimplemented(format!(
                         "{} is not wired to a model worker yet",
@@ -188,16 +279,34 @@ impl pb::rk_model_server_server::RkModelServer for Service {
         let decoded = DecodedInput::try_from(input)?;
         self.check_pair(&first.model, operation, &decoded)?;
 
-        let DecodedInput::Generate(generate) = decoded else {
-            return Err(Status::unimplemented(format!(
-                "{operation} streaming is not wired to a model worker yet"
-            )));
+        let (mut rx, handle): (mpsc::Receiver<Result<Event, Error>>, Cancel) = match decoded {
+            DecodedInput::Generate(generate) => {
+                let (rx, handle) = self.queue_generate(&first.model, generate)?;
+                (rx, Box::new(handle))
+            }
+            DecodedInput::Transcribe {
+                language,
+                first_chunk,
+            } => {
+                // The rest of the call is audio. Opening the session is awaited
+                // here so an unreachable rkwhisperd fails the call itself,
+                // rather than arriving as the stream's first item.
+                let audio = audio_stream(first_chunk, inbound);
+                let (rx, handle) =
+                    transcribe::start(self.asr()?, &first.model, language, audio).await?;
+                (rx, Box::new(handle))
+            }
+            other => {
+                return Err(Status::unimplemented(format!(
+                    "{} streaming is not wired to a model worker yet",
+                    other.operation()
+                )))
+            }
         };
 
-        let (mut rx, handle) = self.queue_generate(&first.model, generate)?;
         let events = async_stream::stream! {
             // Dropped with the stream, which is what tonic does when the peer
-            // sends RST_STREAM. That cancels the run.
+            // sends RST_STREAM. That cancels the run, or the session.
             let _handle = handle;
             while let Some(event) = rx.recv().await {
                 match event {
@@ -278,7 +387,7 @@ mod tests {
                 },
             );
         }
-        (Service::new(registry, models), seen)
+        (Service::new(registry, models, None), seen)
     }
 
     fn generate_input() -> GenerateInput {

@@ -13,13 +13,25 @@ Text generation works end to end on an RK3588 board. Both
 `/v1/chat/completions` and `/v1/responses` are served, streaming and not, with
 reasoning split into its own field. The official `openai` Python SDK passes
 against both, on a reasoning model and one that does not reason.
-`/v1/audio/transcriptions` and `/v1/embeddings` answer 501 until their
-milestones land.
 
 ```sh
 curl localhost:8080/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model": "minicpm4-0.5b", "messages": [{"role": "user", "content": "hi"}]}'
 ```
+
+`/v1/audio/transcriptions` is written and passes against a fake daemon, but has
+not been run against a board yet. The upload is decoded and resampled to 16 kHz
+mono here and streamed to rkwhisperd through the daemon, so transcription starts
+before the upload finishes. All five response formats are served: `json`,
+`text`, `verbose_json`, `srt` and `vtt`. Opus is the one format on OpenAI's list
+that is refused, since symphonia has no decoder for it.
+
+```sh
+curl localhost:8080/v1/audio/transcriptions \
+  -F model=whisper-small-30s -F file=@clip.wav
+```
+
+`/v1/embeddings` answers 501 until its milestone lands.
 
 ## Conformance
 

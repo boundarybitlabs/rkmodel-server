@@ -2,9 +2,11 @@
 //! rather than pretending.
 
 use std::convert::Infallible;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::header;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -12,10 +14,14 @@ use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rkmodel_server_protocol::{Event, Input, Operation, Output, RkModelServer};
+use axum_extra::extract::Multipart;
+use rkmodel_server_protocol::{
+    transcript, Event, Input, Operation, Output, RkModelServer, TranscribeInput,
+};
 use serde_json::json;
 use tokio_stream::StreamExt;
 
+use crate::audio::{self, decode};
 use crate::chat::{self, ChatRequest};
 use crate::error::ApiError;
 use crate::id;
@@ -35,7 +41,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses_endpoint))
-        .route("/v1/audio/transcriptions", post(not_yet))
+        // Axum's default body limit is 2 MB, well under the upload limit this
+        // endpoint documents, so it is raised for this route alone.
+        .route(
+            "/v1/audio/transcriptions",
+            post(transcriptions).layer(DefaultBodyLimit::max(audio::MAX_BODY_BYTES)),
+        )
         .route("/v1/embeddings", post(not_yet))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -438,6 +449,75 @@ async fn responses_endpoint(
     Ok(Sse::new(body).into_response())
 }
 
+/// `transcribe` on the named model.
+///
+/// The upload is decoded here and reaches the daemon as a stream, so rkwhisperd
+/// starts on the first second of a recording while the rest is still being
+/// decoded, and a long clip is never held in memory as PCM.
+async fn transcriptions(
+    State(state): State<Arc<AppState>>,
+    form: Multipart,
+) -> Result<Response, ApiError> {
+    let request = audio::parse(form).await?;
+
+    // Probing reads only the container's headers. Doing it before the call
+    // means an unreadable upload is a 400 rather than a stream the daemon has
+    // already begun reading when it fails.
+    let source = decode::Source::open(request.file, request.filename.as_deref())
+        .map_err(|e| ApiError::invalid_request(e.to_string(), Some("file")))?;
+    tracing::debug!(
+        model = %request.model,
+        rate = source.rate(),
+        "decoding an upload for transcription"
+    );
+
+    let (pcm_s16le, produced) = source.into_stream();
+    let input = Input::Transcribe(TranscribeInput {
+        pcm_s16le,
+        language: request.language.clone(),
+    });
+
+    let mut events = state
+        .daemon
+        .invoke_stream(Operation::Transcribe, &request.model, input)
+        .await?;
+
+    // Transcription is not streamed to the caller yet, so the segments are
+    // collected here and written as one body. rkwhisperd sends them as it
+    // decodes, which is what a future `stream: true` would forward.
+    let mut segments = Vec::new();
+    let mut done = false;
+    while let Some(event) = events.next().await {
+        match event? {
+            Event::Segment(segment) => segments.push(segment),
+            Event::Done { .. } => done = true,
+            Event::TextDelta(_) | Event::ReasoningDelta(_) => {}
+        }
+    }
+    if !done {
+        return Err(ApiError::upstream(
+            "The daemon ended the transcription without a final event.",
+        ));
+    }
+
+    // The decoder counted what it produced, so this is the clip the daemon was
+    // actually sent rather than whatever the upload's header claimed.
+    let duration_s = produced.load(Ordering::Relaxed) as f32 / decode::TARGET_RATE as f32;
+    let body = audio::body(
+        request.format,
+        &transcript(&segments),
+        &segments,
+        duration_s,
+        request.language.as_deref(),
+    );
+
+    Ok((
+        [(header::CONTENT_TYPE, request.format.content_type())],
+        body,
+    )
+        .into_response())
+}
+
 async fn not_yet() -> ApiError {
     ApiError::not_implemented(
         "This endpoint is not implemented yet. See the milestones in MODEL_SERVER.md.",
@@ -449,7 +529,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use rkmodel_server_protocol::{
-        Error, EventStream, FinishReason, GenerateInput, ModelInfo, ModelState, Usage,
+        Error, EventStream, FinishReason, GenerateInput, ModelInfo, ModelState, Segment, Usage,
     };
     use std::sync::Mutex;
     use tower_service::Service as _;
@@ -463,6 +543,9 @@ mod tests {
         events: Vec<Result<Event, Error>>,
         fail: Option<Error>,
         seen: Mutex<Vec<GenerateInput>>,
+        /// The language and the PCM a transcribe call carried, once its audio
+        /// stream has been drained the way the real daemon drains it.
+        heard: Mutex<Vec<(Option<String>, Vec<u8>)>>,
     }
 
     impl Fake {
@@ -532,8 +615,20 @@ mod tests {
             if let Some(e) = &self.fail {
                 return Err(e.clone());
             }
-            if let Input::Generate(g) = input {
-                self.seen.lock().unwrap().push(g);
+            match input {
+                Input::Generate(g) => self.seen.lock().unwrap().push(g),
+                Input::Transcribe(t) => {
+                    // Draining matters: the frontend's decoder writes into a
+                    // bounded channel, so a daemon that never reads would stall
+                    // it rather than fail a test loudly.
+                    let mut audio = t.pcm_s16le;
+                    let mut pcm = Vec::new();
+                    while let Some(chunk) = audio.next().await {
+                        pcm.extend_from_slice(&chunk?);
+                    }
+                    self.heard.lock().unwrap().push((t.language, pcm));
+                }
+                Input::Embed { .. } => {}
             }
             let events = self.events.clone();
             Ok(Box::pin(tokio_stream::iter(events)))
@@ -619,6 +714,70 @@ mod tests {
         ) -> (StatusCode, serde_json::Value) {
             let (status, text) = self.post_raw(uri, body).await;
             (status, serde_json::from_str(&text).unwrap())
+        }
+
+        /// Posts a multipart body built by hand, so these tests need no client.
+        async fn post_form(
+            &mut self,
+            fields: &[(&str, &str)],
+            file: Option<(&str, &[u8])>,
+        ) -> (StatusCode, String, Option<String>) {
+            const BOUNDARY: &str = "----rkmodelservertest";
+            let mut body: Vec<u8> = Vec::new();
+            for (name, value) in fields {
+                body.extend_from_slice(
+                    format!(
+                        "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+            if let Some((filename, bytes)) = file {
+                body.extend_from_slice(
+                    format!(
+                        "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; \
+                         filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+                body.extend_from_slice(bytes);
+                body.extend_from_slice(b"\r\n");
+            }
+            body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+
+            let resp = self
+                .app
+                .call(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/audio/transcriptions")
+                        .header(
+                            "content-type",
+                            format!("multipart/form-data; boundary={BOUNDARY}"),
+                        )
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                status,
+                String::from_utf8(bytes.to_vec()).unwrap(),
+                content_type,
+            )
+        }
+
+        fn heard(&self) -> (Option<String>, Vec<u8>) {
+            self.daemon.heard.lock().unwrap()[0].clone()
         }
 
         fn seen(&self) -> GenerateInput {
@@ -1578,11 +1737,334 @@ mod tests {
     // ---- still unimplemented ----------------------------------------------
 
     #[tokio::test]
-    async fn the_other_endpoints_still_answer_501() {
-        for uri in ["/v1/audio/transcriptions", "/v1/embeddings"] {
-            let mut h = harness(Fake::answering("x", None));
-            let (status, _) = h.post(uri, json!({})).await;
-            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{uri}");
-        }
+    async fn embeddings_still_answers_501() {
+        let mut h = harness(Fake::answering("x", None));
+        let (status, _) = h.post("/v1/embeddings", json!({})).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    // ---- /v1/audio/transcriptions -----------------------------------------
+
+    /// A daemon that answers a transcription with two segments and a final
+    /// event, which is what rkwhisperd's responses map to.
+    fn transcribing() -> Fake {
+        Fake::streaming(vec![
+            Ok(Event::Segment(Segment {
+                text: " the sky".into(),
+                start_s: 0.0,
+                end_s: 1.25,
+            })),
+            Ok(Event::Segment(Segment {
+                text: " is blue".into(),
+                start_s: 1.25,
+                end_s: 2.0,
+            })),
+            Ok(Event::Done {
+                finish: FinishReason::Stop,
+                usage: Usage::default(),
+            }),
+        ])
+    }
+
+    /// A second of 16 kHz mono, which needs no resampling, so a test can check
+    /// the bytes that reached the daemon against the ones that went in.
+    fn clip() -> Vec<u8> {
+        crate::audio::wav(16_000, 1, &crate::audio::sine(16_000, 440.0, 1.0))
+    }
+
+    #[tokio::test]
+    async fn a_transcription_returns_the_joined_text_as_json() {
+        let mut h = harness(transcribing());
+        let (status, body, content_type) = h
+            .post_form(&[("model", "whisper-small-30s")], Some(("a.wav", &clip())))
+            .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(content_type.as_deref(), Some("application/json"));
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value, json!({"text": "the sky is blue"}));
+    }
+
+    #[tokio::test]
+    async fn the_decoded_audio_reaches_the_daemon_as_16khz_mono_pcm() {
+        let mut h = harness(transcribing());
+        let (status, body, _) = h
+            .post_form(&[("model", "whisper-small-30s")], Some(("a.wav", &clip())))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (language, pcm) = h.heard();
+        assert_eq!(language, None);
+        // One second at 16 kHz, two bytes a sample.
+        assert_eq!(pcm.len(), 32_000);
+    }
+
+    #[tokio::test]
+    async fn a_44100_upload_reaches_the_daemon_resampled() {
+        let mut h = harness(transcribing());
+        let upload = crate::audio::wav(44_100, 1, &crate::audio::sine(44_100, 440.0, 1.0));
+        let (status, body, _) = h
+            .post_form(&[("model", "whisper-small-30s")], Some(("a.wav", &upload)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (_, pcm) = h.heard();
+        // A second in, a second out, two bytes a sample.
+        assert_eq!(pcm.len(), 32_000);
+    }
+
+    #[tokio::test]
+    async fn the_language_reaches_the_daemon() {
+        let mut h = harness(transcribing());
+        h.post_form(
+            &[("model", "whisper-small-30s"), ("language", "fr")],
+            Some(("a.wav", &clip())),
+        )
+        .await;
+        assert_eq!(h.heard().0, Some("fr".to_string()));
+    }
+
+    #[tokio::test]
+    async fn an_empty_language_field_is_read_as_unset() {
+        let mut h = harness(transcribing());
+        h.post_form(
+            &[("model", "whisper-small-30s"), ("language", "")],
+            Some(("a.wav", &clip())),
+        )
+        .await;
+        assert_eq!(h.heard().0, None);
+    }
+
+    #[tokio::test]
+    async fn the_text_format_answers_with_the_transcript_alone() {
+        let mut h = harness(transcribing());
+        let (status, body, content_type) = h
+            .post_form(
+                &[("model", "whisper-small-30s"), ("response_format", "text")],
+                Some(("a.wav", &clip())),
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "the sky is blue\n");
+        assert!(content_type.unwrap().starts_with("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn the_srt_format_numbers_its_cues() {
+        let mut h = harness(transcribing());
+        let (status, body, _) = h
+            .post_form(
+                &[("model", "whisper-small-30s"), ("response_format", "srt")],
+                Some(("a.wav", &clip())),
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.starts_with("1\n00:00:00,000 --> 00:00:01,250\nthe sky"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_vtt_format_opens_with_its_header() {
+        let mut h = harness(transcribing());
+        let (status, body, _) = h
+            .post_form(
+                &[("model", "whisper-small-30s"), ("response_format", "vtt")],
+                Some(("a.wav", &clip())),
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.starts_with("WEBVTT\n\n00:00:00.000 --> 00:00:01.250\n"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verbose_json_reports_the_duration_of_the_clip_that_was_sent() {
+        let mut h = harness(transcribing());
+        let (status, body, _) = h
+            .post_form(
+                &[
+                    ("model", "whisper-small-30s"),
+                    ("response_format", "verbose_json"),
+                ],
+                Some(("a.wav", &clip())),
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["task"], "transcribe");
+        assert_eq!(value["duration"], 1.0);
+        assert_eq!(value["segments"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn prompt_and_temperature_are_accepted_and_ignored() {
+        // rkwhisper honours neither, and refusing them would break clients that
+        // always send them.
+        let mut h = harness(transcribing());
+        let (status, _, _) = h
+            .post_form(
+                &[
+                    ("model", "whisper-small-30s"),
+                    ("prompt", "a hint"),
+                    ("temperature", "0.4"),
+                ],
+                Some(("a.wav", &clip())),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_upload_that_is_not_audio_is_refused_before_the_daemon() {
+        let mut h = harness(transcribing());
+        let (status, body, _) = h
+            .post_form(
+                &[("model", "whisper-small-30s")],
+                Some(("a.wav", b"this is not audio at all")),
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["error"]["param"], "file");
+        assert!(
+            h.daemon.heard.lock().unwrap().is_empty(),
+            "nothing should have reached the daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_larger_than_axums_own_default_still_goes_through() {
+        // Axum's default body limit is 2 MB. This endpoint documents 25, so a
+        // 3 MB upload has to reach the decoder rather than being refused while
+        // the body is still being read.
+        let big = crate::audio::wav(16_000, 1, &crate::audio::sine(16_000, 440.0, 100.0));
+        assert!(
+            big.len() > 3 * 1024 * 1024,
+            "the fixture is {} bytes",
+            big.len()
+        );
+
+        let mut h = harness(transcribing());
+        let (status, body, _) = h
+            .post_form(&[("model", "whisper-small-30s")], Some(("a.wav", &big)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_upload_over_the_limit_is_refused_as_too_large() {
+        // Built past MAX_BODY_BYTES, so the limit fires while the body is being
+        // read rather than in the size check after it.
+        let huge = vec![0u8; crate::audio::MAX_BODY_BYTES + 1];
+        let mut h = harness(transcribing());
+        let (status, body, _) = h
+            .post_form(&[("model", "whisper-small-30s")], Some(("a.wav", &huge)))
+            .await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("limit"),
+            "the message should say it is a size problem, got {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_field_over_the_file_limit_is_refused_as_too_large() {
+        // Between the two limits: the body is readable, the file is not
+        // acceptable. This is the case that names the actual size.
+        let over = vec![0u8; crate::audio::MAX_UPLOAD_BYTES + 1];
+        let mut h = harness(transcribing());
+        let (status, body, _) = h
+            .post_form(&[("model", "whisper-small-30s")], Some(("a.wav", &over)))
+            .await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["error"]["param"], "file");
+    }
+
+    #[tokio::test]
+    async fn a_request_with_no_file_is_refused() {
+        let mut h = harness(transcribing());
+        let (status, body, _) = h.post_form(&[("model", "whisper-small-30s")], None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["error"]["param"], "file");
+    }
+
+    #[tokio::test]
+    async fn a_request_with_no_model_is_refused() {
+        let mut h = harness(transcribing());
+        let (status, body, _) = h.post_form(&[], Some(("a.wav", &clip()))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["error"]["param"], "model");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_response_format_is_refused() {
+        let mut h = harness(transcribing());
+        let (status, body, _) = h
+            .post_form(
+                &[("model", "whisper-small-30s"), ("response_format", "yaml")],
+                Some(("a.wav", &clip())),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["error"]["param"], "response_format");
+    }
+
+    #[tokio::test]
+    async fn asking_for_a_streamed_transcription_is_refused_rather_than_ignored() {
+        let mut h = harness(transcribing());
+        let (status, body, _) = h
+            .post_form(
+                &[("model", "whisper-small-30s"), ("stream", "true")],
+                Some(("a.wav", &clip())),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["error"]["param"], "stream");
+    }
+
+    #[tokio::test]
+    async fn a_busy_rkwhisperd_becomes_503_with_retry_after() {
+        let mut h = harness(Fake::broken(Error::Busy {
+            retry_after_ms: 2_500,
+        }));
+        let (status, _, _) = h
+            .post_form(&[("model", "whisper-small-30s")], Some(("a.wav", &clip())))
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_transcription_that_never_finishes_is_not_reported_as_complete() {
+        // Segments arrived, the final event never did. A partial transcript
+        // must not be returned as a whole one.
+        let mut h = harness(Fake::streaming(vec![Ok(Event::Segment(Segment {
+            text: " the sky".into(),
+            start_s: 0.0,
+            end_s: 1.25,
+        }))]));
+        let (status, _, _) = h
+            .post_form(&[("model", "whisper-small-30s")], Some(("a.wav", &clip())))
+            .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

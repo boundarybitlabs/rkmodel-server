@@ -5,6 +5,7 @@ mod generate;
 mod models;
 mod registry;
 mod service;
+mod transcribe;
 mod worker;
 
 use std::net::SocketAddr;
@@ -59,13 +60,28 @@ async fn main() -> Result<()> {
     let models = Arc::new(models::Models::default());
     models::spawn_loaders(&config, registry.clone(), models.clone());
 
+    // rkwhisperd loads nothing here, so transcribe models have no loader. A
+    // probe reports whether that daemon is answering, and keeps reporting.
+    let asr = config.rkwhisper_socket.clone().map(|socket| {
+        Arc::new(transcribe::rkwhisper::Rkwhisper::new(socket)) as Arc<dyn transcribe::Asr>
+    });
+    if let Some(asr) = &asr {
+        let transcribe_models = config
+            .models
+            .iter()
+            .filter(|m| m.backend == config::Backend::Rkwhisper)
+            .map(|m| m.id.clone())
+            .collect();
+        transcribe::probe::spawn(transcribe_models, asr.clone(), registry.clone());
+    }
+
     tracing::info!(%listen, "serving");
     Server::builder()
         .http2_keepalive_interval(Some(Duration::from_secs(10)))
         .http2_keepalive_timeout(Some(Duration::from_secs(5)))
         .tcp_nodelay(true)
         .add_service(pb::rk_model_server_server::RkModelServerServer::new(
-            service::Service::new(registry, models),
+            service::Service::new(registry, models, asr),
         ))
         .serve_with_shutdown(listen, async {
             let _ = tokio::signal::ctrl_c().await;

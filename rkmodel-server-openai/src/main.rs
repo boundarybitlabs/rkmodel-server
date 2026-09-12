@@ -1,6 +1,7 @@
 //! The OpenAI-compatible HTTP frontend. Needs no hardware, and connects to the
 //! daemon lazily, so it starts whether or not the daemon is up.
 
+mod audio;
 mod chat;
 mod error;
 mod id;

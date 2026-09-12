@@ -7,6 +7,7 @@ use axum::Json;
 use rkmodel_server_protocol::Error;
 use serde_json::json;
 
+#[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     body: serde_json::Value,
@@ -25,6 +26,21 @@ impl ApiError {
                 "message": message.into(),
                 "type": "invalid_request_error",
                 "param": param,
+                "code": null,
+            }}),
+            retry_after_ms: None,
+        }
+    }
+
+    /// An upload refused on size. OpenAI answers 413 for this, and SDKs map
+    /// that to their own error rather than the generic 400.
+    pub fn too_large(message: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            body: json!({"error": {
+                "message": message.into(),
+                "type": "invalid_request_error",
+                "param": "file",
                 "code": null,
             }}),
             retry_after_ms: None,
