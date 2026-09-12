@@ -69,6 +69,16 @@ pub struct ModelConfig {
     /// toolkit stores them at fp16 while quantizing the layers to w8a8, so a
     /// 2 GB model can carry 5 GB of embeddings.
     pub embed_flash: Option<bool>,
+    /// Whether a run may start from what the runtime cached for the run
+    /// before it. Unset is true.
+    ///
+    /// The runtime keeps the KV cache of the last prompt and reuses whatever
+    /// prefix the next one shares, even with history off. Measured on the
+    /// board, that is sound for Qwen3 and not for Gemma 4 E2B: a repeated tool
+    /// prompt, or one differing only after its declarations, came back as
+    /// though the model never saw the user's question. False clears the cache
+    /// before every run, which costs the shared prefill.
+    pub reuse_kv_cache: Option<bool>,
 
     // rknn
     pub rknn: Option<PathBuf>,
@@ -209,6 +219,13 @@ impl ModelConfig {
             bail!(
                 "model {}: `tool_format` needs the generate operation",
                 self.id
+            );
+        }
+        if self.reuse_kv_cache.is_some() && self.backend != Backend::Rkllm {
+            bail!(
+                "model {}: `reuse_kv_cache` is an rkllm setting, not {:?}",
+                self.id,
+                self.backend
             );
         }
         if self.embed_flash.is_some() && self.backend != Backend::Rkllm {
@@ -436,6 +453,37 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("tool_format"), "{err}");
+    }
+
+    #[test]
+    fn reuse_kv_cache_is_an_rkllm_setting() {
+        let c = parse(
+            r#"
+            [[models]]
+            id = "gemma-4-e2b"
+            operations = ["generate"]
+            backend = "rkllm"
+            rkllm = "/x.rkllm"
+            reuse_kv_cache = false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.models[0].reuse_kv_cache, Some(false));
+
+        let err = parse(
+            r#"
+            [[models]]
+            id = "bge"
+            operations = ["embed"]
+            backend = "rknn"
+            rknn = "/m.rknn"
+            tokenizer = "/t.json"
+            reuse_kv_cache = false
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("reuse_kv_cache"), "{err}");
     }
 
     #[test]

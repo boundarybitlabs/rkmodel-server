@@ -407,6 +407,9 @@ tokenizer = "/models/gemma-4-e2b/tokenizer.json"
 # daemon loads with skip_special_token off. See Markers that are special tokens.
 reasoning = { start = "<|channel>thought\n", end = "<channel|>", default = false }
 tool_format = "gemma4"
+# The runtime's reuse of a shared prompt prefix corrupts Gemma's runs. See
+# Repeated prompts.
+reuse_kv_cache = false
 max_context_len = 16384
 # The toolkit leaves both embedding tables at fp16 while quantizing the layers
 # to w8a8, so this file is 8 GB of which 5.5 GB is embeddings. Reading them from
@@ -828,8 +831,23 @@ remembered count when the runtime reports a skipped prefill for that same
 prompt. A zero against any other prompt is left alone, since there is nothing
 honest to put there.
 
-The saved prefill is a real speedup, and nothing here gives it up. Only the
-accounting is corrected.
+The saved prefill is a real speedup, and Qwen3 keeps it. Only the accounting
+is corrected, and under Plan B the daemon reports the prompt's own length
+instead, since it knows it exactly.
+
+**Gemma 4 E2B cannot keep it.** The runtime reuses not just an identical prompt
+but whatever prefix the next prompt shares, and for Gemma that reuse is not
+sound. Measured on the board, at temperature 0 from a freshly loaded daemon, a
+tool prompt about Paris produced the call. Sent again, it came back "I need a
+specific location to give you the weather", as though the question were never
+read, and so did a later Paris request after two unrelated ones. A 116-token
+prompt sharing a prefix with the one before reported 35 prefill tokens. Qwen3
+passed the whole SDK suite, shared prefixes and all, with reuse on.
+
+`reuse_kv_cache = false` on a model clears the whole cache before every run,
+through `clear_kv_cache`. With it set, the same sequence called the tool every
+time the question named Paris. It costs the shared prefill, which on a tool
+prompt is the declarations.
 
 ### Counting generated tokens
 
@@ -1330,11 +1348,13 @@ is templates, parsers and adapters, and it adds no hardware path.
 - [x] `/v1/chat/completions`: tools, tool turns, `tool_calls` streaming and not
 - [x] `/v1/responses`: tools, `function_call` and `function_call_output` items,
       streaming and not
-- [ ] The official SDK covers both in `tests/sdk_conformance.py`: a full round
-      trip, the stream accumulators, and a forced call
-- [ ] On the board: a multi-turn tool loop on Qwen3 and on Gemma 4 E2B, with
-      reasoning on and off, and each item under
-      [To verify on the board](#to-verify-on-the-board) that tools depend on
+- [x] The official SDK covers both in `tests/sdk_conformance.py`: a full round
+      trip, the stream accumulators, and a forced call. It passes against
+      Qwen3-0.6B and Gemma 4 E2B on the board, with `RKMODEL_TOOLS` set.
+- [x] On the board: a tool loop on Qwen3 and on Gemma 4 E2B, through the
+      official SDK on both endpoints. See board check 14 for what each model
+      needs to answer from a result.
+- [ ] Board check 16, whether a run stopped from a callback gets its perf stats
 
 ### 4. Images
 
@@ -1403,14 +1423,21 @@ which the server had written nothing.
     answers nonsense without one. `<bos>` in the rendered prompt added exactly
     one prefill token and fixed the answer.
 14. **Answered for the two models on the board.** How reliably each model calls
-    tools, at its size and quantization. Qwen3-0.6B, with reasoning off, wrote
-    a well-formed call unprompted. Gemma 4 E2B did too, but only from Hugging
-    Face's token ids: as text, the runtime tokenized the prompt into 99 tokens
-    rather than 92, and Gemma never called. With reasoning on, even from the
-    right ids, Gemma read its own tool declaration back as malformed and
-    answered without the tool. So reasoning with tools on Gemma 4 E2B is not
-    usable at this quantization, and forcing a call is the reliable path when
-    reasoning is wanted.
+    tools, at its size and quantization.
+    - Qwen3-0.6B, with reasoning off, calls unprompted, and answers from the
+      result: "The current weather in Paris is 21°C with clear skies."
+    - Gemma 4 E2B calls unprompted only from Hugging Face's token ids, and only
+      from a clean KV cache; see Rendering prompts and Repeated prompts. Even
+      then it is unreliable left to choose: at temperature 0 it called for
+      Paris and asked which city for London. With reasoning on, on the first
+      turn, it read its own declaration back as malformed. Forcing a call
+      works every time.
+    - After a tool result, Gemma needs reasoning. With it off, its first token
+      is `<eos>`, whether the prompt ends at `<tool_response|>` as the template
+      renders it, adds a newline, or opens a new model turn. With it on it
+      reasons and answers: "The current weather in Paris is 21 degrees Celsius
+      with a clear sky." So a Gemma tool loop wants reasoning off for the call
+      and on for the answer.
 15. Which tokens the runtime's tokenizer splits differently for Gemma. Plan B
     makes it moot for text, but it matters for images, which need text.
 16. Whether a run stopped from inside a callback, which the tool parser does

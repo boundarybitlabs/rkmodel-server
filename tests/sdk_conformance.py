@@ -13,7 +13,13 @@ tunnel to one.
 Transcription is checked against RKMODEL_WHISPER_MODEL, which defaults to
 whisper-small-30s. Set it to an empty string to skip those checks where no
 rkwhisperd is running.
+
+Tools are checked when RKMODEL_TOOLS is set, since only a model with a
+tool_format takes them. Where a check needs a call, it forces one with
+tool_choice, so what is checked is the API rather than whether a small model
+chose to call.
 """
+import json
 import os
 import sys
 
@@ -28,6 +34,7 @@ MODEL = sys.argv[2] if len(sys.argv) > 2 else os.environ.get(
 # Transcription is a different model on a different daemon, so it is named
 # separately. Set it to "" to skip those checks on a host with no rkwhisperd.
 WHISPER = os.environ.get("RKMODEL_WHISPER_MODEL", "whisper-small-30s")
+TOOLS = bool(os.environ.get("RKMODEL_TOOLS"))
 
 client = openai.OpenAI(base_url=BASE_URL, api_key=os.environ.get("RKMODEL_API_KEY", "unused"))
 print(f"testing {BASE_URL} with model {MODEL}\n")
@@ -246,6 +253,159 @@ except openai.BadRequestError as e:
     check("n=2 raises BadRequestError", True, e.body.get("param"))
 except Exception as e:
     check("n=2 raises BadRequestError", False, type(e).__name__)
+
+
+# ---- tools -----------------------------------------------------------------
+
+WEATHER = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string", "description": "City name"}},
+            "required": ["city"],
+        },
+    },
+}
+# The Responses API spells the same tool flat.
+WEATHER_FLAT = {"type": "function", **WEATHER["function"]}
+FORCE = {"type": "function", "function": {"name": "get_weather"}}
+ASK = [{"role": "user", "content": "What is the weather in Paris right now?"}]
+
+
+def object_arguments(arguments):
+    try:
+        return isinstance(json.loads(arguments), dict)
+    except ValueError:
+        return False
+
+
+if not TOOLS:
+    print("\nSKIP  tool checks - set RKMODEL_TOOLS for a model with a tool_format")
+else:
+    print()
+    r = client.chat.completions.create(
+        model=MODEL, messages=ASK, tools=[WEATHER], tool_choice=FORCE, max_tokens=200,
+    )
+    message = r.choices[0].message
+    calls = message.tool_calls or []
+    check("a forced call comes back as a typed tool call", len(calls) >= 1, message.model_dump())
+    check("finish_reason is tool_calls", r.choices[0].finish_reason == "tool_calls",
+          r.choices[0].finish_reason)
+    if calls:
+        call = calls[0]
+        check("it calls the forced function", call.function.name == "get_weather", call.function.name)
+        check("its arguments are a JSON object", object_arguments(call.function.arguments),
+              call.function.arguments)
+        check("its id is set", bool(call.id), call.id)
+        check("a message that only calls has no content", not message.content, message.content)
+
+        # The loop: the call and its result go back, and the model answers.
+        # Reasoning is asked for, since Gemma 4 E2B ends its turn at once after
+        # a tool result unless it reasons, and a budget is left for it.
+        followup = client.chat.completions.create(
+            model=MODEL,
+            messages=ASK + [message.model_dump(exclude_none=True),
+                            {"role": "tool", "tool_call_id": call.id,
+                             "content": json.dumps({"temperature_c": 21, "sky": "clear"})}],
+            tools=[WEATHER],
+            max_tokens=2000,
+            reasoning_effort="medium",
+        )
+        answer = followup.choices[0].message
+        check("the model answers once it has the result",
+              bool((answer.content or "").strip()) or bool(answer.tool_calls),
+              (answer.content or "")[:80])
+
+    # The SDK's stream helper accumulates tool call deltas and validates them.
+    stream_api = getattr(client.chat.completions, "stream", None) or client.beta.chat.completions.stream
+    with stream_api(model=MODEL, messages=ASK, tools=[WEATHER], tool_choice=FORCE,
+                    max_tokens=200) as stream:
+        final = stream.get_final_completion()
+    streamed = final.choices[0].message.tool_calls or []
+    check("a streamed call accumulates into a tool call", len(streamed) >= 1,
+          final.choices[0].message.model_dump())
+    if streamed:
+        check("with parseable arguments", object_arguments(streamed[0].function.arguments),
+              streamed[0].function.arguments)
+    check("and a tool_calls finish", final.choices[0].finish_reason == "tool_calls",
+          final.choices[0].finish_reason)
+
+    # pydantic_function_tool sets strict on every tool, which is accepted.
+    try:
+        import pydantic
+
+        class GetWeather(pydantic.BaseModel):
+            """Get the current weather for a city"""
+            city: str
+
+        r = client.chat.completions.create(
+            model=MODEL, messages=ASK, tools=[openai.pydantic_function_tool(GetWeather)],
+            tool_choice={"type": "function", "function": {"name": "GetWeather"}}, max_tokens=200,
+        )
+        check("a strict pydantic tool is accepted", r.choices[0].finish_reason == "tool_calls",
+              r.choices[0].finish_reason)
+    except ImportError:
+        print("SKIP  pydantic_function_tool - pydantic is not installed")
+
+    r = client.chat.completions.create(model=MODEL, messages=ASK, tools=[WEATHER],
+                                       max_tokens=300, reasoning_effort="none")
+    choice = r.choices[0]
+    check("left to choose, the model calls or answers",
+          bool(choice.message.tool_calls) or bool((choice.message.content or "").strip()),
+          f"finish={choice.finish_reason}")
+    print(f"      (it {'called' if choice.message.tool_calls else 'answered'})")
+
+    r = client.responses.create(
+        model=MODEL, input=ASK[0]["content"], tools=[WEATHER_FLAT],
+        tool_choice={"type": "function", "name": "get_weather"}, max_output_tokens=200,
+    )
+    items = [i for i in r.output if i.type == "function_call"]
+    check("a forced response call is a function_call item", len(items) >= 1,
+          [i.type for i in r.output])
+    check("the response is completed", r.status == "completed", r.status)
+    if items:
+        item = items[0]
+        check("the item's arguments are a JSON object", object_arguments(item.arguments), item.arguments)
+        check("it has a call_id", bool(item.call_id), item.call_id)
+
+        followup = client.responses.create(
+            model=MODEL,
+            input=[{"role": "user", "content": ASK[0]["content"]},
+                   *[i.model_dump(exclude_none=True) for i in r.output],
+                   {"type": "function_call_output", "call_id": item.call_id,
+                    "output": json.dumps({"temperature_c": 21, "sky": "clear"})}],
+            tools=[WEATHER_FLAT], max_output_tokens=2000, reasoning={"effort": "medium"},
+        )
+        check("function_call_output is accepted and answered",
+              bool(followup.output_text.strip()) or any(i.type == "function_call" for i in followup.output),
+              followup.output_text[:80])
+
+    seen, terminal = [], None
+    stream = client.responses.create(
+        model=MODEL, input=ASK[0]["content"], tools=[WEATHER_FLAT],
+        tool_choice={"type": "function", "name": "get_weather"}, max_output_tokens=200, stream=True,
+    )
+    for event in stream:
+        seen.append(event.type)
+        if event.type in ("response.completed", "response.incomplete", "response.failed"):
+            terminal = event
+    check("a streamed response call brackets its arguments",
+          "response.function_call_arguments.delta" in seen
+          and "response.function_call_arguments.done" in seen, sorted(set(seen)))
+    check("and the terminal response carries the call",
+          terminal is not None and any(i.type == "function_call" for i in terminal.response.output),
+          terminal.type if terminal else None)
+
+    try:
+        client.responses.create(model=MODEL, input="hi", tools=[{"type": "web_search"}])
+        check("a built-in tool raises BadRequestError", False, "no exception")
+    except openai.BadRequestError as e:
+        check("a built-in tool raises BadRequestError", True, e.body.get("param"))
+    except Exception as e:
+        check("a built-in tool raises BadRequestError", False, type(e).__name__)
 
 
 # ---- transcription ---------------------------------------------------------

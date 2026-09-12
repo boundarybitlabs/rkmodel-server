@@ -25,6 +25,8 @@ pub struct RkllmBackend {
     /// real count is remembered and substituted. A different prompt in between
     /// evicts the cache and prefill is measured again.
     last_prefill: Mutex<Option<(String, u32)>>,
+    /// Clear the KV cache before each run. See `ModelConfig::reuse_kv_cache`.
+    clear_cache: bool,
 }
 
 /// The input token count to report, given what the runtime said.
@@ -125,6 +127,7 @@ impl RkllmBackend {
             session,
             model: model.id.clone(),
             last_prefill: Mutex::new(None),
+            clear_cache: model.reuse_kv_cache == Some(false),
         })
     }
 }
@@ -169,6 +172,15 @@ impl Backend for RkllmBackend {
         }
         if let Some(n) = max_new_tokens {
             params = params.max_new_tokens(n as i32);
+        }
+
+        if self.clear_cache {
+            self.session
+                .clear_kv_cache(false)
+                .map_err(|e| Error::Runtime {
+                    call: format!("clear_kv_cache on {}: {e}", self.model),
+                    code: -1,
+                })?;
         }
 
         let mut stats = RunStats::default();
@@ -226,12 +238,14 @@ impl Backend for RkllmBackend {
             });
         }
 
-        // Under Plan B the prompt's length is known exactly, which covers a run
-        // stopped from a callback before the runtime reported anything.
-        if stats.prefill_tokens == 0 {
-            if let Some(tokens) = &prompt.tokens {
-                stats.prefill_tokens = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
-            }
+        // Under Plan B the prompt's length is known exactly, and the runtime's
+        // count is not: measured on the board, a Gemma prompt of 116 tokens
+        // that shared a prefix with the run before it reported 35, which is
+        // what it prefilled rather than what the prompt is. The exact length
+        // also covers a run stopped from a callback before anything was
+        // reported.
+        if let Some(tokens) = &prompt.tokens {
+            stats.prefill_tokens = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
         }
 
         let mut last = self.last_prefill.lock().expect("prefill lock");
