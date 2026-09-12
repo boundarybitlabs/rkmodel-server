@@ -1297,9 +1297,10 @@ board yet.
 ### 3. Tool calling
 
 Specified in [Tool calls](#tool-calls) and
-[Tools, on both endpoints](#tools-on-both-endpoints). Nothing is written yet.
-Almost all of it tests off the board, since it is templates, parsers and
-adapters, and it adds no hardware path.
+[Tools, on both endpoints](#tools-on-both-endpoints). The daemon side is
+written, and Gemma's BOS, special-token and tokenizer fixes have run on the
+board. The endpoints are next. Almost all of it tests off the board, since it
+is templates, parsers and adapters, and it adds no hardware path.
 
 - [x] Protocol: `Role::Tool`, `Tool`, `ToolCall`, `ToolChoice`, the tool fields
       of `Message` and `GenerateInput`, `Event::ToolCall`,
@@ -1307,24 +1308,24 @@ adapters, and it adds no hardware path.
       `protocol_version`
 - [x] Template environment: a Python-compatible `tojson`, `raise_exception`,
       and `bos_token` and `eos_token` from `tokenizer_config.json`
-- [ ] `tools`, `tool_calls`, `tool_call_id` and `reasoning_content` in the
+- [x] `tools`, `tool_calls`, `tool_call_id` and `reasoning_content` in the
       template context
-  - [ ] The real Qwen3 and Gemma 4 templates render a tool round trip byte for
+  - [x] The real Qwen3 and Gemma 4 templates render a tool round trip byte for
         byte as `transformers` does
 - [x] Load with `skip_special_token(false)`, dropping end-of-turn tokens,
       which also fixes Gemma's reasoning split
-- [ ] `tool_format` in config, checked at load
+- [x] `tool_format` in config, checked at load
 - [x] Plan B for models with `tokenizer` set, which Gemma 4 needs to call
       tools, or to answer well at all. The `tokenizers` crate, built without
       its C and C++ dependencies, matches Hugging Face's Python tokenizer id
       for id on eight Gemma prompts.
-- [ ] The `hermes` parser
-- [ ] The `gemma4` parser, including its argument syntax and stopping at
+- [x] The `hermes` parser
+- [x] The `gemma4` parser, including its argument syntax and stopping at
       `<|tool_response>`
-- [ ] `parallel_tool_calls: false` stops after the first call
-- [ ] `tool_choice`: `none`, `auto`, and `required` and a named function by
+- [x] `parallel_tool_calls: false` stops after the first call
+- [x] `tool_choice`: `none`, `auto`, and `required` and a named function by
       appending the start of a call to the prompt
-- [ ] Markers stripped from user text and tool results
+- [x] Markers stripped from user text and tool results
 - [ ] `/v1/chat/completions`: tools, tool turns, `tool_calls` streaming and not
 - [ ] `/v1/responses`: tools, `function_call` and `function_call_output` items,
       streaming and not
@@ -1411,6 +1412,10 @@ which the server had written nothing.
     reasoning is wanted.
 15. Which tokens the runtime's tokenizer splits differently for Gemma. Plan B
     makes it moot for text, but it matters for images, which need text.
+16. Whether a run stopped from inside a callback, which the tool parser does
+    after a call, still gets a final callback with its perf stats. If not,
+    Plan B falls back to its own prompt length, and Plan A reports zero input
+    tokens for that run.
 
 ## Changes to other crates
 

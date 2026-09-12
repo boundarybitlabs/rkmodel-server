@@ -9,19 +9,22 @@
 //! code until it lands. They are covered by this module's tests meanwhile.
 #![allow(dead_code)]
 
+pub mod output;
 pub mod reasoning;
 pub mod sampling;
 pub mod template;
+pub mod tools;
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rkmodel_server_protocol::Error;
+use rkmodel_server_protocol::{Error, GenerateInput, ToolChoice};
 use tokenizers::Tokenizer;
 
-use crate::config::{ModelConfig, Sampling};
+use crate::config::{ModelConfig, Sampling, ToolFormat};
 use crate::worker::Prompt;
 use template::ChatTemplate;
+use tools::{ForcedStart, ToolCallParser};
 
 /// Everything a `generate` model needs that is not the weights.
 ///
@@ -40,6 +43,39 @@ pub struct GenerateModel {
     /// tool prompt into 99 tokens where Hugging Face's makes 92, and Gemma only
     /// called the tool when given the 92.
     pub tokenizer: Option<Tokenizer>,
+    /// How this model writes a tool call. `None` refuses tools.
+    pub tool_format: Option<ToolFormat>,
+}
+
+/// How a request's tools shape its run.
+pub struct ToolRun {
+    /// Whether the template is given the tools. `tool_choice: none` leaves
+    /// them out, though earlier tool turns still render.
+    pub offered: bool,
+    /// The start of a call written into the prompt, for a choice that forces
+    /// one.
+    pub forced: Option<ForcedStart>,
+    /// `None` when calls are not looked for.
+    pub parser: Option<ToolCallParser>,
+}
+
+impl ToolRun {
+    fn none() -> ToolRun {
+        ToolRun {
+            offered: false,
+            forced: None,
+            parser: None,
+        }
+    }
+}
+
+/// OpenAI's rule for a function name, which also keeps a name safe to write
+/// into a prompt when a choice forces it.
+fn valid_tool_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +107,16 @@ impl GenerateModel {
             template.add_special_tokens(extra);
         }
 
+        if let Some(format) = model.tool_format {
+            if !template.reads_tools() {
+                anyhow::bail!(
+                    "model {} has a tool_format, but its chat template never reads `tools`",
+                    model.id
+                );
+            }
+            template.add_special_tokens(format.reserved().iter().map(|m| m.to_string()));
+        }
+
         // Only a configured tokenizer switches to Plan B. One that merely sits
         // beside the template is read for its special tokens and nothing else.
         let tokenizer = match &model.tokenizer {
@@ -95,6 +141,63 @@ impl GenerateModel {
             max_context_len: model.max_context_len,
             max_new_tokens: model.max_new_tokens,
             tokenizer,
+            tool_format: model.tool_format,
+        })
+    }
+
+    /// Checks a request's tools against this model, and works out what they
+    /// ask of the run.
+    pub fn tool_run(&self, input: &GenerateInput) -> Result<ToolRun, Error> {
+        let choice = input.tool_choice.clone().unwrap_or(ToolChoice::Auto);
+        if input.tools.is_empty() {
+            return match choice {
+                ToolChoice::Required | ToolChoice::Function(_) => Err(Error::InvalidInput(
+                    "tool_choice asks for a call, but no tools were given".into(),
+                )),
+                ToolChoice::None | ToolChoice::Auto => Ok(ToolRun::none()),
+            };
+        }
+        let Some(format) = self.tool_format else {
+            return Err(Error::InvalidInput("this model does not take tools".into()));
+        };
+
+        let mut names: Vec<String> = Vec::with_capacity(input.tools.len());
+        for tool in &input.tools {
+            if !valid_tool_name(&tool.name) {
+                return Err(Error::InvalidInput(format!(
+                    "tool name {:?} must be 1 to 64 letters, digits, underscores or dashes",
+                    tool.name
+                )));
+            }
+            if names.contains(&tool.name) {
+                return Err(Error::InvalidInput(format!(
+                    "tool {} is declared twice",
+                    tool.name
+                )));
+            }
+            names.push(tool.name.clone());
+        }
+        if let ToolChoice::Function(name) = &choice {
+            if !names.contains(name) {
+                return Err(Error::InvalidInput(format!(
+                    "tool_choice names {name}, which is not among the tools"
+                )));
+            }
+        }
+        if choice == ToolChoice::None {
+            return Ok(ToolRun::none());
+        }
+
+        let forced = format.forced_start(&choice);
+        let stop_after_first = input.parallel_tool_calls == Some(false);
+        let mut parser = ToolCallParser::new(format, names, stop_after_first);
+        if let Some(start) = &forced {
+            parser = parser.primed(&start.body);
+        }
+        Ok(ToolRun {
+            offered: true,
+            forced,
+            parser: Some(parser),
         })
     }
 
@@ -236,7 +339,102 @@ default = false"#,
             max_context_len,
             max_new_tokens: None,
             tokenizer: Some(tiny_tokenizer()),
+            tool_format: None,
         }
+    }
+
+    fn with_tools() -> GenerateModel {
+        let mut m = plan_b(None);
+        m.tokenizer = None;
+        m.tool_format = Some(ToolFormat::Hermes);
+        m
+    }
+
+    fn tools_input(names: &[&str], choice: Option<ToolChoice>) -> GenerateInput {
+        GenerateInput {
+            tools: names
+                .iter()
+                .map(|n| rkmodel_server_protocol::Tool {
+                    name: n.to_string(),
+                    description: None,
+                    parameters_json: None,
+                })
+                .collect(),
+            tool_choice: choice,
+            ..Default::default()
+        }
+    }
+
+    fn invalid(result: Result<ToolRun, Error>) -> String {
+        match result {
+            Err(Error::InvalidInput(m)) => m,
+            Err(other) => panic!("expected InvalidInput, got {other:?}"),
+            Ok(_) => panic!("expected InvalidInput, got a run"),
+        }
+    }
+
+    #[test]
+    fn tool_choices_decide_what_the_run_does() {
+        let m = with_tools();
+        let auto = m.tool_run(&tools_input(&["f"], None)).unwrap();
+        assert!(auto.offered && auto.forced.is_none() && auto.parser.is_some());
+
+        let none = m
+            .tool_run(&tools_input(&["f"], Some(ToolChoice::None)))
+            .unwrap();
+        assert!(!none.offered && none.parser.is_none());
+
+        let forced = m
+            .tool_run(&tools_input(
+                &["f", "g"],
+                Some(ToolChoice::Function("g".into())),
+            ))
+            .unwrap();
+        assert_eq!(
+            forced.forced.unwrap().prompt,
+            "<tool_call>\n{\"name\": \"g\", \"arguments\": "
+        );
+
+        let nothing = m.tool_run(&tools_input(&[], None)).unwrap();
+        assert!(!nothing.offered && nothing.parser.is_none());
+    }
+
+    #[test]
+    fn bad_tool_requests_are_refused_with_a_reason() {
+        let m = with_tools();
+        let msg = invalid(m.tool_run(&tools_input(&["f"], Some(ToolChoice::Function("g".into())))));
+        assert!(msg.contains("not among the tools"), "{msg}");
+
+        let msg = invalid(m.tool_run(&tools_input(&["f\"}; evil"], None)));
+        assert!(msg.contains("letters, digits"), "{msg}");
+
+        let msg = invalid(m.tool_run(&tools_input(&["f", "f"], None)));
+        assert!(msg.contains("twice"), "{msg}");
+
+        let msg = invalid(m.tool_run(&tools_input(&[], Some(ToolChoice::Required))));
+        assert!(msg.contains("no tools"), "{msg}");
+
+        let mut plain = with_tools();
+        plain.tool_format = None;
+        let msg = invalid(plain.tool_run(&tools_input(&["f"], None)));
+        assert!(msg.contains("does not take tools"), "{msg}");
+    }
+
+    #[test]
+    fn a_tool_format_with_a_template_that_ignores_tools_fails_to_load() {
+        let dir = std::env::temp_dir().join(format!("rkmodel-tools-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let template = dir.join("chat_template.jinja");
+        std::fs::write(&template, "{{ messages[0].content }}").unwrap();
+
+        let mut config = model_config(template.to_str(), None);
+        config.tool_format = Some(ToolFormat::Hermes);
+        let err = load_err(&config);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            format!("{err:#}").contains("never reads `tools`"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -308,6 +506,7 @@ default = false"#,
             max_context_len: None,
             max_new_tokens: None,
             tokenizer: None,
+            tool_format: None,
         };
         assert!(!m.wants_reasoning(None));
         // A client asking a non-reasoning model to reason is a hint, not an
@@ -331,6 +530,7 @@ default = false"#,
             max_context_len: None,
             max_new_tokens: None,
             tokenizer: None,
+            tool_format: None,
         };
         assert!(m.wants_reasoning(None), "absent takes the model's default");
         assert!(!m.wants_reasoning(Some(false)));
@@ -350,6 +550,7 @@ default = false"#,
             max_context_len: None,
             max_new_tokens: None,
             tokenizer: None,
+            tool_format: None,
         };
         assert!(m
             .parser("<|im_start|>assistant\n<think>\n", true)

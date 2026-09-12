@@ -16,6 +16,7 @@ use crate::worker::RunHandle;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::generate::output::OutputParser;
 use crate::generate::sampling;
 use crate::models::{LoadedGenerate, Models};
 use crate::registry::Registry;
@@ -62,14 +63,23 @@ impl Service {
             .get_generate(model)
             .ok_or_else(|| Error::Unavailable(format!("{model} is not loaded")))?;
 
-        let reasoning_on = loaded.model.wants_reasoning(input.reasoning);
-        let prompt = loaded
+        let tools = loaded.model.tool_run(&input)?;
+        // A forced call does not reason. Reasoning comes before a call, and the
+        // prompt already ends inside one.
+        let reasoning_on = tools.forced.is_none() && loaded.model.wants_reasoning(input.reasoning);
+        let offered: &[rkmodel_server_protocol::Tool] =
+            if tools.offered { &input.tools } else { &[] };
+        let mut prompt = loaded
             .model
             .template
-            .render(&input.messages, reasoning_on)
+            .render_with_tools(&input.messages, offered, reasoning_on)
             .map_err(|e| Error::InvalidInput(format!("rendering the prompt failed: {e:#}")))?;
 
-        let parser = loaded.model.parser(&prompt, reasoning_on);
+        let reasoning = loaded.model.parser(&prompt, reasoning_on);
+        if let Some(start) = &tools.forced {
+            prompt.push_str(&start.prompt);
+        }
+        let parser = OutputParser::new(reasoning, tools.parser);
         let budgets = sampling::resolve(loaded.model.sampling, loaded.model.max_new_tokens, &input);
         let prompt = loaded.model.prompt(prompt, budgets.max_new_tokens)?;
 
@@ -383,6 +393,7 @@ mod tests {
                         max_context_len: None,
                         max_new_tokens: None,
                         tokenizer: None,
+                        tool_format: None,
                     },
                     worker: {
                         let backend = Arc::new(FakeBackend::new(&["the sky ", "is blue"]));
@@ -393,6 +404,142 @@ mod tests {
             );
         }
         (Service::new(registry, models, None), seen)
+    }
+
+    /// Qwen3's real template, reasoning on by default, and a backend that
+    /// replays `chunks`.
+    fn tool_service(chunks: &[&str]) -> (Service, Arc<std::sync::Mutex<Vec<String>>>) {
+        let config: Config = toml::from_str(
+            r#"
+            [[models]]
+            id = "qwen3"
+            operations = ["generate"]
+            backend = "rkllm"
+            rkllm = "/models/qwen3.rkllm"
+            tool_format = "hermes"
+            "#,
+        )
+        .unwrap();
+        let registry = Arc::new(Registry::from_config(&config).unwrap());
+        registry.set_state("qwen3", ModelState::Ready);
+        let models = Arc::new(Models::default());
+        let template = ChatTemplate::from_source(
+            include_str!("../fixtures/qwen3-chat-template.jinja").into(),
+            Default::default(),
+        )
+        .unwrap();
+        let backend = Arc::new(FakeBackend::new(chunks));
+        let seen = backend.seen.clone();
+        models.insert_generate(
+            "qwen3".to_string(),
+            LoadedGenerate {
+                model: GenerateModel {
+                    template,
+                    reasoning: Some(crate::generate::ReasoningMarkers {
+                        start: "<think>".into(),
+                        end: "</think>".into(),
+                        default_on: true,
+                    }),
+                    sampling: Default::default(),
+                    max_context_len: None,
+                    max_new_tokens: None,
+                    tokenizer: None,
+                    tool_format: Some(crate::config::ToolFormat::Hermes),
+                },
+                worker: Worker::start("qwen3".into(), backend, 4, vec!["<|im_end|>".into()]),
+            },
+        );
+        (Service::new(registry, models, None), seen)
+    }
+
+    fn weather_input(choice: Option<rkmodel_server_protocol::ToolChoice>) -> GenerateInput {
+        GenerateInput {
+            messages: vec![Message::text(Role::User, "Weather in Paris?")],
+            tools: vec![rkmodel_server_protocol::Tool {
+                name: "get_weather".into(),
+                description: Some("Current weather".into()),
+                parameters_json: Some(r#"{"type": "object"}"#.into()),
+            }],
+            tool_choice: choice,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_model_that_calls_a_tool_returns_the_call() {
+        let (s, seen) = tool_service(&[
+            "<think>\nneed weather\n</think>\n\n",
+            "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
+            "<|im_end|>",
+        ]);
+        let output = s.generate_once("qwen3", weather_input(None)).await.unwrap();
+        let Output::Generated {
+            text,
+            reasoning,
+            tool_calls,
+            finish,
+            ..
+        } = output
+        else {
+            panic!("expected Generated");
+        };
+        assert_eq!(text, "");
+        assert_eq!(reasoning.as_deref(), Some("\nneed weather\n"));
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].arguments_json, r#"{"city":"Paris"}"#);
+        assert_eq!(finish, rkmodel_server_protocol::FinishReason::ToolCalls);
+
+        let prompt = seen.lock().unwrap()[0].clone();
+        assert!(
+            prompt.contains("<tools>\n{\"type\": \"function\""),
+            "{prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forced_function_is_written_into_the_prompt_without_reasoning() {
+        let (s, seen) = tool_service(&["{\"city\": \"Paris\"}}\n</tool_call>", "<|im_end|>"]);
+        let choice = rkmodel_server_protocol::ToolChoice::Function("get_weather".into());
+        let output = s
+            .generate_once("qwen3", weather_input(Some(choice)))
+            .await
+            .unwrap();
+        let Output::Generated { tool_calls, .. } = output else {
+            panic!("expected Generated");
+        };
+        assert_eq!(tool_calls[0].name, "get_weather");
+
+        let prompt = seen.lock().unwrap()[0].clone();
+        assert!(
+            prompt.ends_with(
+                "<|im_start|>assistant\n<think>\n\n</think>\n\n\
+                 <tool_call>\n{\"name\": \"get_weather\", \"arguments\": "
+            ),
+            "{prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_choice_none_leaves_the_tools_out() {
+        let (s, seen) = tool_service(&["It is sunny."]);
+        let choice = rkmodel_server_protocol::ToolChoice::None;
+        s.generate_once("qwen3", weather_input(Some(choice)))
+            .await
+            .unwrap();
+        let prompt = seen.lock().unwrap()[0].clone();
+        assert!(!prompt.contains("<tools>"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn tools_sent_to_a_model_without_a_tool_format_are_refused() {
+        let err = service(true)
+            .generate_once("qwen3-4b", weather_input(None))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidInput(m) if m.contains("does not take tools")),
+            "{err:?}"
+        );
     }
 
     fn generate_input() -> GenerateInput {

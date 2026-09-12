@@ -34,7 +34,9 @@ symphonia = { version = "0.6", features = ["mpa", "aac", "isomp4", "alac"] }
 # 147/160, so a proper band-limited resampler rather than dropping samples.
 rubato = "5"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order keeps a tool schema's keys as the client wrote them, all the way
+# into the prompt.
+serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
 # preserve_order keeps a map's keys in the order they were written, which is
 # what Python's dict does and what a template's `tojson` must reproduce.

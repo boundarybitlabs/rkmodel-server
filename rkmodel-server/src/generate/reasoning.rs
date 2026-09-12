@@ -144,7 +144,7 @@ fn emit(state: State, text: &str) -> Vec<Piece> {
 /// How many bytes at the end of `buf` form a proper prefix of `marker`.
 ///
 /// Longest first, so `<think` beats `<` and the held tail stays minimal.
-fn partial_suffix(buf: &str, marker: &str) -> usize {
+pub(crate) fn partial_suffix(buf: &str, marker: &str) -> usize {
     let max = marker.len().saturating_sub(1).min(buf.len());
     for len in (1..=max).rev() {
         let at = buf.len() - len;

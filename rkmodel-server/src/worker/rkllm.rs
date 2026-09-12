@@ -226,6 +226,14 @@ impl Backend for RkllmBackend {
             });
         }
 
+        // Under Plan B the prompt's length is known exactly, which covers a run
+        // stopped from a callback before the runtime reported anything.
+        if stats.prefill_tokens == 0 {
+            if let Some(tokens) = &prompt.tokens {
+                stats.prefill_tokens = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+            }
+        }
+
         let mut last = self.last_prefill.lock().expect("prefill lock");
         stats.prefill_tokens = prefill_tokens(last.as_ref(), &prompt.text, stats.prefill_tokens);
         if stats.prefill_tokens > 0 {

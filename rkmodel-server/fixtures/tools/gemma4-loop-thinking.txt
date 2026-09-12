@@ -1,0 +1,9 @@
+<bos><|turn>system
+<|think|>
+You are helpful.<|tool>declaration:get_weather{description:<|"|>Weather for a city, <5 words & 'quoted'<|"|>,parameters:{properties:{city:{description:<|"|>City name<|"|>,type:<|"|>STRING<|"|>},unit:{enum:[<|"|>c<|"|>,<|"|>f<|"|>],type:<|"|>STRING<|"|>}},required:[<|"|>city<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:get_time{description:<|"|>Local time<|"|>}<tool|><turn|>
+<|turn>user
+Weather in Paris and London?<turn|>
+<|turn>model
+<|channel>thought
+need both
+<channel|><|tool_call>call:get_weather{city:<|"|>Paris<|"|>,unit:<|"|>c<|"|>}<tool_call|><|tool_call>call:get_weather{city:<|"|>London<|"|>}<tool_call|><|tool_response>response:get_weather{value:<|"|>{"temp": 21}<|"|>}<tool_response|><|tool_response>response:get_weather{value:<|"|>{"temp": 15}<|"|>}<tool_response|><|channel>thought

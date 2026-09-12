@@ -21,7 +21,7 @@ use rkmodel_server_protocol::{Error, Event, FinishReason, Usage};
 use tokio::sync::mpsc;
 
 use crate::config::Sampling;
-use crate::generate::reasoning::{Piece, ReasoningParser};
+use crate::generate::output::OutputParser;
 
 pub use backend::{Backend, Prompt};
 
@@ -39,7 +39,7 @@ struct Job {
     prompt: Prompt,
     sampling: Option<Sampling>,
     max_new_tokens: Option<u32>,
-    parser: ReasoningParser,
+    parser: OutputParser,
     events: mpsc::Sender<Result<Event, Error>>,
     cancelled: Arc<AtomicBool>,
 }
@@ -138,7 +138,7 @@ impl Worker {
         prompt: Prompt,
         sampling: Option<Sampling>,
         max_new_tokens: Option<u32>,
-        parser: ReasoningParser,
+        parser: OutputParser,
     ) -> Result<(mpsc::Receiver<Result<Event, Error>>, RunHandle), Error> {
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -212,13 +212,20 @@ fn run_job(inner: &Arc<Inner>, mut job: Job) {
                     return backend::Flow::Continue;
                 }
                 *text_callbacks += 1;
-                for p in parser.push(text) {
-                    if events.blocking_send(Ok(event_for(p))).is_err() {
+                let (out, stop) = parser.push(text);
+                for event in out {
+                    if events.blocking_send(Ok(event)).is_err() {
                         // Nobody is listening any more.
                         return backend::Flow::Stop;
                     }
                 }
-                backend::Flow::Continue
+                // A parser stops a run that would otherwise go on to invent a
+                // tool's result, or make a second call it was told not to.
+                if stop {
+                    backend::Flow::Stop
+                } else {
+                    backend::Flow::Continue
+                }
             },
         )
     };
@@ -235,14 +242,19 @@ fn run_job(inner: &Arc<Inner>, mut job: Job) {
             let _ = job.events.blocking_send(Err(e));
         }
         Ok(stats) => {
-            for p in job.parser.finish() {
-                if job.events.blocking_send(Ok(event_for(p))).is_err() {
+            for event in job.parser.finish() {
+                if job.events.blocking_send(Ok(event)).is_err() {
                     return;
                 }
             }
             let generated = generated_tokens(stats.generate_tokens, text_callbacks);
+            let finish = if job.parser.called() {
+                FinishReason::ToolCalls
+            } else {
+                finish_reason(generated, job.max_new_tokens)
+            };
             let _ = job.events.blocking_send(Ok(Event::Done {
-                finish: finish_reason(generated, job.max_new_tokens),
+                finish,
                 usage: Usage {
                     input_tokens: stats.prefill_tokens,
                     output_tokens: generated,
@@ -250,13 +262,6 @@ fn run_job(inner: &Arc<Inner>, mut job: Job) {
                 },
             }));
         }
-    }
-}
-
-fn event_for(piece: Piece) -> Event {
-    match piece {
-        Piece::Reasoning(s) => Event::ReasoningDelta(s),
-        Piece::Text(s) => Event::TextDelta(s),
     }
 }
 
@@ -284,14 +289,76 @@ fn finish_reason(generated: u32, budget: Option<u32>) -> FinishReason {
 mod tests {
     use super::backend::fake::FakeBackend;
     use super::*;
+    use crate::config::ToolFormat;
+    use crate::generate::reasoning::ReasoningParser;
+    use crate::generate::tools::ToolCallParser;
     use std::time::Duration;
 
-    fn parser() -> ReasoningParser {
-        ReasoningParser::disabled()
+    fn parser() -> OutputParser {
+        OutputParser::plain()
     }
 
-    fn reasoning_parser() -> ReasoningParser {
-        ReasoningParser::new("<think>", "</think>", false)
+    fn reasoning_parser() -> OutputParser {
+        OutputParser::new(ReasoningParser::new("<think>", "</think>", false), None)
+    }
+
+    fn tool_parser(stop_after_first: bool) -> OutputParser {
+        OutputParser::new(
+            ReasoningParser::disabled(),
+            Some(ToolCallParser::new(
+                ToolFormat::Gemma4,
+                vec!["get_weather".into()],
+                stop_after_first,
+            )),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_run_that_calls_a_tool_finishes_tool_calls_and_stops_before_a_result() {
+        let backend = Arc::new(FakeBackend::new(&[
+            "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>",
+            "<|tool_response>",
+            "response:get_weather{value:30}",
+            "<tool_response|>",
+        ]));
+        let w = Worker::start("m".into(), backend, 4, Vec::new());
+        let (rx, handle) = w
+            .submit("p".into(), None, None, tool_parser(false))
+            .unwrap();
+        let events = drain(rx).await;
+        drop(handle);
+
+        assert!(
+            matches!(&events[0], Ok(Event::ToolCall(c)) if c.name == "get_weather"),
+            "{events:?}"
+        );
+        let Some(Ok(Event::Done { finish, usage })) = events.last() else {
+            panic!("no final event: {events:?}");
+        };
+        assert_eq!(*finish, FinishReason::ToolCalls);
+        // The fake counts what it delivered before being told to stop: the
+        // call and the start of the invented result, and nothing after.
+        assert_eq!(usage.output_tokens, 2);
+        assert_eq!(events.len(), 2, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_call_cut_off_by_the_budget_is_text_and_length() {
+        let backend = Arc::new(FakeBackend::new(&["<|tool_call>call:get_", "weather{"]));
+        let w = Worker::start("m".into(), backend, 4, Vec::new());
+        let (rx, handle) = w
+            .submit("p".into(), None, Some(2), tool_parser(false))
+            .unwrap();
+        let events = drain(rx).await;
+        drop(handle);
+        assert_eq!(deltas(&events), "<|tool_call>call:get_weather{");
+        assert!(matches!(
+            events.last(),
+            Some(Ok(Event::Done {
+                finish: FinishReason::Length,
+                ..
+            }))
+        ));
     }
 
     /// Drains a run to completion, returning every event.
