@@ -86,6 +86,12 @@ impl RkllmBackend {
             param = param.embed_flash(from_flash);
         }
 
+        // By default the runtime leaves special tokens out of callback text.
+        // Gemma's reasoning and tool markers are special tokens, so a parser
+        // would never see them. Kept, every token arrives as its text on a
+        // callback of its own, and the worker drops the ones that end a turn.
+        param = param.skip_special_token(false);
+
         // Streaming only works from a single-input session, and a batched one
         // needs exactly n_batch inputs per run. Batching is future work.
         param = param

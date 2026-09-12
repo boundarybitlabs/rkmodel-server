@@ -36,7 +36,9 @@ rubato = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-minijinja = { version = "2", features = ["loader", "builtins"] }
+# preserve_order keeps a map's keys in the order they were written, which is
+# what Python's dict does and what a template's `tojson` must reproduce.
+minijinja = { version = "2", features = ["loader", "builtins", "preserve_order"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 thiserror = "2"
 anyhow = "1"

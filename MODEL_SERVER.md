@@ -635,9 +635,10 @@ What that changes:
 
 - **End-of-turn tokens now arrive as text.** Qwen3 ends with `<|im_end|>`, and
   Gemma with `<turn|>`, or with `<eos>` after a tool call, and a client must see
-  none of them. The daemon drops the callback of any token the model's
-  `tokenizer_config.json` names as `eos_token`, or as Gemma's `eot_token`, by
-  id, since the id is on every callback. Anything else special that a model emits outside a marker, which
+  none of them. The daemon drops any callback whose whole text is a token the
+  model's `tokenizer_config.json` names as `eos_token`, `pad_token`, or Gemma's
+  `eot_token`. Matching the whole text is enough, since a special token arrives
+  on a callback of its own, and it needs no token ids from a `tokenizer.json`. Anything else special that a model emits outside a marker, which
   should be rare, passes through as text rather than being guessed at.
 - **Special tokens still get their own callback.** In the default mode the
   special token's callback arrived with its id and empty text, not folded

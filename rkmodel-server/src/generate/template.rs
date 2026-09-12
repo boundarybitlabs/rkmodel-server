@@ -23,6 +23,51 @@ pub struct ChatTemplate {
     /// Sorted longest first, so stripping `<|im_start|>` is never left holding
     /// a shorter token that is a prefix of it.
     special_tokens: Vec<String>,
+    tokens: NamedTokens,
+}
+
+/// The special tokens a `tokenizer_config.json` names, which Hugging Face hands
+/// every template and which tell the daemon where a turn ends.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NamedTokens {
+    pub bos: Option<String>,
+    pub eos: Option<String>,
+    /// Gemma's end of turn, which is not its end-of-sequence token.
+    pub eot: Option<String>,
+    pub pad: Option<String>,
+}
+
+impl NamedTokens {
+    /// Reads `bos_token` and the rest, each either a string or, in older
+    /// configs, an object with a `content` field.
+    pub fn from_tokenizer_config(config: &serde_json::Value) -> NamedTokens {
+        let named = |key: &str| {
+            let value = config.get(key)?;
+            let text = match value {
+                serde_json::Value::String(s) => s.as_str(),
+                other => other.get("content")?.as_str()?,
+            };
+            (!text.is_empty()).then(|| text.to_string())
+        };
+        NamedTokens {
+            bos: named("bos_token"),
+            eos: named("eos_token"),
+            eot: named("eot_token"),
+            pad: named("pad_token"),
+        }
+    }
+
+    /// Tokens that end a turn or the sequence. With special tokens left in the
+    /// runtime's output, these arrive as text, and a client must not see them.
+    pub fn end_of_turn(&self) -> Vec<String> {
+        let mut out: Vec<String> = [&self.eos, &self.eot, &self.pad]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        out.dedup();
+        out
+    }
 }
 
 /// What a template sees for one message.
@@ -43,21 +88,38 @@ fn role_str(role: Role) -> &'static str {
 impl ChatTemplate {
     /// Reads a template from `chat_template.jinja`, or from the
     /// `chat_template` field of a `tokenizer_config.json`.
+    ///
+    /// A bare `.jinja` carries no token names, so they come from a
+    /// `tokenizer_config.json` beside it when there is one. Gemma ships that
+    /// way, and its template emits `bos_token`, without which it does not work.
     pub fn load(path: &Path) -> Result<ChatTemplate> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading chat template {}", path.display()))?;
 
-        let (source, special) = if path.extension().is_some_and(|e| e == "json") {
-            let config: serde_json::Value = serde_json::from_str(&text)
-                .with_context(|| format!("parsing {}", path.display()))?;
+        let (source, config) = if path.extension().is_some_and(|e| e == "json") {
+            let config = read_json(path)?;
             let source = extract_template(&config)
                 .with_context(|| format!("no chat_template in {}", path.display()))?;
-            (source, special_from_tokenizer_config(&config))
+            (source, Some(config))
         } else {
-            (text, BTreeSet::new())
+            let sibling = path
+                .parent()
+                .map(|dir| dir.join("tokenizer_config.json"))
+                .filter(|p| p.exists());
+            (text, sibling.as_deref().map(read_json).transpose()?)
         };
 
-        Self::from_source(source, special)
+        let (special, tokens) = match &config {
+            Some(c) => (
+                special_from_tokenizer_config(c),
+                NamedTokens::from_tokenizer_config(c),
+            ),
+            None => (BTreeSet::new(), NamedTokens::default()),
+        };
+
+        let mut template = Self::from_source(source, special)?;
+        template.tokens = tokens;
+        Ok(template)
     }
 
     pub fn from_source(source: String, special: BTreeSet<String>) -> Result<ChatTemplate> {
@@ -66,6 +128,11 @@ impl ChatTemplate {
         // `.split()`, `.startswith()` and `.strip()`, which Jinja has no
         // equivalent for.
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        // Both of these are Hugging Face's, not Jinja's. Qwen3's template
+        // serializes tools with `tojson`, and Gemma's raises on arguments it
+        // cannot render.
+        env.add_filter("tojson", tojson);
+        env.add_function("raise_exception", raise_exception);
         env.add_template_owned("chat", source)
             .context("compiling chat template")?;
 
@@ -75,7 +142,18 @@ impl ChatTemplate {
         Ok(ChatTemplate {
             env,
             special_tokens,
+            tokens: NamedTokens::default(),
         })
+    }
+
+    /// The special tokens the model's `tokenizer_config.json` names.
+    pub fn tokens(&self) -> &NamedTokens {
+        &self.tokens
+    }
+
+    pub fn with_tokens(mut self, tokens: NamedTokens) -> Self {
+        self.tokens = tokens;
+        self
     }
 
     /// Adds special tokens to strip, for models that keep them in a separate
@@ -142,9 +220,88 @@ impl ChatTemplate {
             messages => rendered,
             add_generation_prompt => true,
             enable_thinking => enable_thinking,
+            bos_token => defined(&self.tokens.bos),
+            eos_token => defined(&self.tokens.eos),
         })
         .context("rendering chat template")
     }
+}
+
+/// A token a model does not name is undefined to its template, as it is under
+/// Hugging Face, rather than `none`, which renders as the text "none".
+fn defined(token: &Option<String>) -> minijinja::Value {
+    token
+        .as_deref()
+        .map(minijinja::Value::from)
+        .unwrap_or(minijinja::Value::UNDEFINED)
+}
+
+fn read_json(path: &Path) -> Result<serde_json::Value> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Hugging Face's `tojson`, which is `json.dumps(value, ensure_ascii=False)`.
+///
+/// minijinja's own filter, behind its `json` feature, is not a substitute. It
+/// escapes `<`, `>`, `&` and `'` for HTML and writes no spaces after `,` and
+/// `:`, so a tool's description would reach the model spelled differently from
+/// how it was trained to read one.
+fn tojson(value: minijinja::Value) -> Result<String, minijinja::Error> {
+    struct PythonFormatter;
+
+    impl serde_json::ser::Formatter for PythonFormatter {
+        fn begin_array_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            writer: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if first {
+                Ok(())
+            } else {
+                writer.write_all(b", ")
+            }
+        }
+
+        fn begin_object_key<W: ?Sized + std::io::Write>(
+            &mut self,
+            writer: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if first {
+                Ok(())
+            } else {
+                writer.write_all(b", ")
+            }
+        }
+
+        fn begin_object_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            writer: &mut W,
+        ) -> std::io::Result<()> {
+            writer.write_all(b": ")
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut out, PythonFormatter);
+    value.serialize(&mut serializer).map_err(|e| {
+        minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            "cannot serialize to JSON",
+        )
+        .with_source(e)
+    })?;
+    Ok(String::from_utf8(out).expect("serde_json writes UTF-8"))
+}
+
+/// Templates call this to refuse input they cannot render.
+fn raise_exception(message: String) -> Result<minijinja::Value, minijinja::Error> {
+    Err(minijinja::Error::new(
+        minijinja::ErrorKind::InvalidOperation,
+        message,
+    ))
 }
 
 /// `chat_template` is usually a string. Some models ship a list of named
@@ -409,6 +566,116 @@ mod tests {
         let got = qwen3_real().render(&messages, true).unwrap();
         assert!(!got.contains("pondering"), "{got:?}");
         assert!(got.contains("the answer"), "{got:?}");
+    }
+
+    /// The real template Gemma 4 E2B ships, as a bare `.jinja` beside a
+    /// `tokenizer_config.json`.
+    const GEMMA4_REAL: &str = include_str!("../../fixtures/gemma4-chat-template.jinja");
+
+    fn gemma_tokens() -> NamedTokens {
+        NamedTokens::from_tokenizer_config(&serde_json::json!({
+            "bos_token": "<bos>",
+            "eos_token": "<eos>",
+            "eot_token": "<turn|>",
+            "pad_token": "<pad>",
+        }))
+    }
+
+    #[test]
+    fn the_real_gemma4_template_starts_with_bos() {
+        // Measured on the board: without `<bos>`, Gemma 4 E2B asks for context
+        // instead of answering. These are the strings `transformers` renders.
+        let t = ChatTemplate::from_source(GEMMA4_REAL.to_string(), BTreeSet::new())
+            .unwrap()
+            .with_tokens(gemma_tokens());
+        assert_eq!(
+            t.render(&convo(), false).unwrap(),
+            "<bos><|turn>system\nYou are a helpful assistant.<turn|>\n\
+             <|turn>user\nWhy is the sky blue?<turn|>\n<|turn>model\n"
+        );
+        assert_eq!(
+            t.render(&convo(), true).unwrap(),
+            "<bos><|turn>system\n<|think|>\nYou are a helpful assistant.<turn|>\n\
+             <|turn>user\nWhy is the sky blue?<turn|>\n<|turn>model\n"
+        );
+    }
+
+    #[test]
+    fn a_bare_jinja_takes_its_token_names_from_the_config_beside_it() {
+        let dir = std::env::temp_dir().join(format!("rkmodel-template-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("chat_template.jinja"),
+            "{{ bos_token }}{{ messages[0].content }}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"bos_token": {"content": "<s>"}, "eos_token": "</s>"}"#,
+        )
+        .unwrap();
+
+        let t = ChatTemplate::load(&dir.join("chat_template.jinja")).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(t.tokens().bos.as_deref(), Some("<s>"));
+        assert_eq!(
+            t.render(&[Message::text(Role::User, "hi")], false).unwrap(),
+            "<s>hi"
+        );
+    }
+
+    #[test]
+    fn a_template_with_no_token_names_renders_bos_as_nothing() {
+        let t = ChatTemplate::from_source("{{ bos_token }}x".into(), BTreeSet::new()).unwrap();
+        assert_eq!(
+            t.render(&[Message::text(Role::User, "hi")], false).unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn end_of_turn_tokens_are_eos_eot_and_pad() {
+        assert_eq!(gemma_tokens().end_of_turn(), ["<eos>", "<turn|>", "<pad>"]);
+        let qwen = NamedTokens::from_tokenizer_config(&serde_json::json!({
+            "eos_token": "<|im_end|>",
+            "pad_token": "<|endoftext|>",
+            "bos_token": null,
+        }));
+        assert_eq!(qwen.bos, None);
+        assert_eq!(qwen.end_of_turn(), ["<|im_end|>", "<|endoftext|>"]);
+    }
+
+    #[test]
+    fn tojson_writes_what_python_json_dumps_writes() {
+        // `json.dumps({"b": "<5 & 'q'", "a": [1, 2.5, None, True]},
+        // ensure_ascii=False)`: spaces after separators, keys in the order
+        // written, and nothing escaped for HTML.
+        let t = ChatTemplate::from_source(
+            r#"{{ {"b": "<5 & 'q'", "a": [1, 2.5, none, true]} | tojson }}"#.into(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            t.render(&[Message::text(Role::User, "")], false).unwrap(),
+            r#"{"b": "<5 & 'q'", "a": [1, 2.5, null, true]}"#
+        );
+    }
+
+    #[test]
+    fn raise_exception_fails_the_render_with_its_message() {
+        let t = ChatTemplate::from_source(
+            "{{ raise_exception('arguments must be a mapping') }}".into(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        let err = t
+            .render(&[Message::text(Role::User, "")], false)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("arguments must be a mapping"),
+            "{err:#}"
+        );
     }
 
     #[test]

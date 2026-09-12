@@ -56,6 +56,9 @@ struct Inner {
     current: Mutex<Option<u64>>,
     backend: Arc<dyn Backend>,
     next_id: AtomicU64,
+    /// Tokens that end a turn, which arrive as text because the runtime is told
+    /// to keep special tokens, and which a client must never see.
+    end_of_turn: Vec<String>,
 }
 
 pub struct Worker {
@@ -95,13 +98,22 @@ impl Drop for RunHandle {
 
 impl Worker {
     /// Starts the thread that owns this model's session.
-    pub fn start(model: String, backend: Arc<dyn Backend>, queue_depth: usize) -> Worker {
+    ///
+    /// `end_of_turn` lists the tokens dropped from the output, such as Qwen's
+    /// `<|im_end|>` or Gemma's `<turn|>`.
+    pub fn start(
+        model: String,
+        backend: Arc<dyn Backend>,
+        queue_depth: usize,
+        end_of_turn: Vec<String>,
+    ) -> Worker {
         let (tx, rx) = sync_channel::<Job>(queue_depth);
         let inner = Arc::new(Inner {
             tx,
             current: Mutex::new(None),
             backend: backend.clone(),
             next_id: AtomicU64::new(0),
+            end_of_turn,
         });
 
         let thread_inner = inner.clone();
@@ -193,6 +205,12 @@ fn run_job(inner: &Arc<Inner>, mut job: Job) {
                     // character completes. Nothing to forward.
                     return backend::Flow::Continue;
                 };
+                // Each special token arrives on a callback of its own, so an
+                // end-of-turn token is the whole of its text. It is not counted
+                // either, since the runtime's `generate_tokens` leaves it out.
+                if inner.end_of_turn.iter().any(|t| t == text) {
+                    return backend::Flow::Continue;
+                }
                 *text_callbacks += 1;
                 for p in parser.push(text) {
                     if events.blocking_send(Ok(event_for(p))).is_err() {
@@ -296,9 +314,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn end_of_turn_tokens_are_dropped_and_not_counted() {
+        let backend = Arc::new(FakeBackend::new(&["Paris", "<turn|>"]));
+        let w = Worker::start(
+            "m".into(),
+            backend,
+            4,
+            vec!["<eos>".into(), "<turn|>".into()],
+        );
+        let (rx, handle) = w.submit("p".into(), None, None, parser()).unwrap();
+        let events = drain(rx).await;
+        drop(handle);
+
+        assert_eq!(deltas(&events), "Paris");
+        // The fake reports two generated tokens, as a runtime counting the end
+        // token would. The daemon's own count, one, must not exceed it.
+        let Some(Ok(Event::Done { usage, .. })) = events.last() else {
+            panic!("no final event: {events:?}");
+        };
+        assert_eq!(usage.output_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn text_that_merely_contains_an_end_token_is_kept() {
+        let backend = Arc::new(FakeBackend::new(&["say <turn|> please"]));
+        let w = Worker::start("m".into(), backend, 4, vec!["<turn|>".into()]);
+        let (rx, handle) = w.submit("p".into(), None, None, parser()).unwrap();
+        let events = drain(rx).await;
+        drop(handle);
+        assert_eq!(deltas(&events), "say <turn|> please");
+    }
+
+    #[tokio::test]
     async fn a_run_streams_its_deltas_then_done() {
         let backend = Arc::new(FakeBackend::new(&["Hello", ", ", "world"]));
-        let w = Worker::start("m".into(), backend, 4);
+        let w = Worker::start("m".into(), backend, 4, Vec::new());
         let (rx, handle) = w.submit("prompt".into(), None, None, parser()).unwrap();
 
         let events = drain(rx).await;
@@ -319,7 +369,7 @@ mod tests {
     async fn the_prompt_reaches_the_backend_unchanged() {
         let backend = Arc::new(FakeBackend::new(&["x"]));
         let seen = backend.seen.clone();
-        let w = Worker::start("m".into(), backend, 4);
+        let w = Worker::start("m".into(), backend, 4, Vec::new());
         let (rx, handle) = w
             .submit(
                 "<|im_start|>user\nhi<|im_end|>\n".into(),
@@ -336,7 +386,7 @@ mod tests {
     #[tokio::test]
     async fn reasoning_is_split_from_content() {
         let backend = Arc::new(FakeBackend::new(&["<think>", "hmm", "</think>", "blue"]));
-        let w = Worker::start("m".into(), backend, 4);
+        let w = Worker::start("m".into(), backend, 4, Vec::new());
         let (rx, handle) = w
             .submit("p".into(), None, None, reasoning_parser())
             .unwrap();
@@ -357,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn hitting_the_budget_finishes_with_length() {
         let backend = Arc::new(FakeBackend::new(&["a", "b", "c", "d"]));
-        let w = Worker::start("m".into(), backend, 4);
+        let w = Worker::start("m".into(), backend, 4, Vec::new());
         let (rx, handle) = w.submit("p".into(), None, Some(2), parser()).unwrap();
         let events = drain(rx).await;
         drop(handle);
@@ -375,7 +425,7 @@ mod tests {
         // exactly one more.
         let backend =
             Arc::new(FakeBackend::new(&["a"]).slow(Duration::from_millis(400), Duration::ZERO));
-        let w = Worker::start("m".into(), backend, 1);
+        let w = Worker::start("m".into(), backend, 1, Vec::new());
 
         let _first = w.submit("p".into(), None, None, parser()).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -399,7 +449,7 @@ mod tests {
         let backend =
             Arc::new(FakeBackend::new(&["a"]).slow(Duration::from_millis(300), Duration::ZERO));
         let runs = backend.runs.clone();
-        let w = Worker::start("m".into(), backend, 4);
+        let w = Worker::start("m".into(), backend, 4, Vec::new());
 
         let (_rx1, first) = w.submit("p".into(), None, None, parser()).unwrap();
         let (_rx2, second) = w.submit("p".into(), None, None, parser()).unwrap();
@@ -424,7 +474,7 @@ mod tests {
                 .slow(Duration::ZERO, Duration::from_millis(60)),
         );
         let aborted = backend.aborted.clone();
-        let w = Worker::start("m".into(), backend, 4);
+        let w = Worker::start("m".into(), backend, 4, Vec::new());
 
         let (mut rx, handle) = w.submit("p".into(), None, None, parser()).unwrap();
         // Wait for generation to actually be in flight.
@@ -441,7 +491,7 @@ mod tests {
             FakeBackend::new(&["a", "b", "c", "d", "e", "f"])
                 .slow(Duration::ZERO, Duration::from_millis(60)),
         );
-        let w = Worker::start("m".into(), backend, 4);
+        let w = Worker::start("m".into(), backend, 4, Vec::new());
         let (mut rx, handle) = w.submit("p".into(), None, None, parser()).unwrap();
         let _ = rx.recv().await;
         handle.cancel();
@@ -461,7 +511,7 @@ mod tests {
         // past its own run. The lock around the current id is what prevents it.
         let backend = Arc::new(FakeBackend::new(&["a"]));
         let aborted = backend.aborted.clone();
-        let w = Worker::start("m".into(), backend, 4);
+        let w = Worker::start("m".into(), backend, 4, Vec::new());
 
         let (rx, first) = w.submit("p".into(), None, None, parser()).unwrap();
         drain(rx).await;
@@ -482,7 +532,7 @@ mod tests {
             call: "run_llm".into(),
             code: -1,
         }));
-        let w = Worker::start("m".into(), backend, 4);
+        let w = Worker::start("m".into(), backend, 4, Vec::new());
         let (rx, handle) = w.submit("p".into(), None, None, parser()).unwrap();
         let events = drain(rx).await;
         drop(handle);
@@ -499,7 +549,7 @@ mod tests {
         let backend =
             Arc::new(FakeBackend::new(&["a"]).slow(Duration::from_millis(150), Duration::ZERO));
         let runs = backend.runs.clone();
-        let w = Worker::start("m".into(), backend, 8);
+        let w = Worker::start("m".into(), backend, 8, Vec::new());
 
         let handles: Vec<_> = (0..3)
             .map(|_| w.submit("p".into(), None, None, parser()).unwrap())
@@ -525,7 +575,7 @@ mod tests {
         // tell a client the model finished when it was cut off.
         let mut backend = FakeBackend::new(&["a", "b", "c", "d", "e"]);
         backend.stats.generate_tokens = 4;
-        let w = Worker::start("m".into(), Arc::new(backend), 4);
+        let w = Worker::start("m".into(), Arc::new(backend), 4, Vec::new());
         let (rx, handle) = w.submit("p".into(), None, Some(5), parser()).unwrap();
         let events = drain(rx).await;
         drop(handle);

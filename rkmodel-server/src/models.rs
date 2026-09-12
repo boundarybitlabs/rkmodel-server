@@ -109,7 +109,8 @@ fn load_generate(spec: ModelSpec, registry: Arc<Registry>, models: Arc<Models>) 
         }
     };
 
-    let worker = Worker::start(id.clone(), backend, spec.queue_depth);
+    let end_of_turn = generate.template.tokens().end_of_turn();
+    let worker = Worker::start(id.clone(), backend, spec.queue_depth, end_of_turn);
     models.insert_generate(
         id.clone(),
         LoadedGenerate {

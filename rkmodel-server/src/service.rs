@@ -382,7 +382,7 @@ mod tests {
                     worker: {
                         let backend = Arc::new(FakeBackend::new(&["the sky ", "is blue"]));
                         seen = Some(backend.seen.clone());
-                        Worker::start("qwen3-4b".into(), backend, 4)
+                        Worker::start("qwen3-4b".into(), backend, 4, Vec::new())
                     },
                 },
             );

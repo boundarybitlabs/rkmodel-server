@@ -65,8 +65,11 @@ impl ReasoningParser {
 
     /// Whether a rendered prompt leaves the model already inside its reasoning
     /// block.
+    ///
+    /// Both sides are trimmed, since a start marker can end in a newline, as
+    /// Gemma's `<|channel>thought\n` does.
     pub fn prompt_opens_reasoning(prompt: &str, start: &str) -> bool {
-        prompt.trim_end().ends_with(start)
+        prompt.trim_end().ends_with(start.trim_end())
     }
 
     /// Counts callbacks that arrived while inside reasoning, which assumes one
@@ -233,6 +236,14 @@ mod tests {
             run(&mut p, &["hmm", "</think>", "blue"]),
             vec![reasoning("hmm"), text("blue")]
         );
+    }
+
+    #[test]
+    fn a_start_marker_ending_in_a_newline_is_recognised() {
+        assert!(ReasoningParser::prompt_opens_reasoning(
+            "<tool_response|><|channel>thought\n",
+            "<|channel>thought\n"
+        ));
     }
 
     #[test]
