@@ -17,6 +17,15 @@ use crate::error::ApiError;
 /// checks against it sees the same answer here.
 pub const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 
+/// The cap on the whole multipart body: the file, plus boundaries, headers and
+/// the other fields.
+///
+/// Axum's own default is 2 MB, which is far under the file limit above and
+/// would refuse most real uploads before any of this code saw them, so the
+/// route sets this explicitly. The slack is for the framing, which is a few
+/// hundred bytes in practice.
+pub const MAX_BODY_BYTES: usize = MAX_UPLOAD_BYTES + 1024 * 1024;
+
 /// What the caller asked to get back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseFormat {
@@ -77,29 +86,17 @@ pub async fn parse(mut form: Multipart) -> Result<TranscriptionRequest, ApiError
     let mut language = None;
     let mut format = ResponseFormat::Json;
 
-    while let Some(field) = form
-        .next_field()
-        .await
-        .map_err(|e| ApiError::invalid_request(format!("The upload is malformed: {e}"), None))?
-    {
+    while let Some(field) = form.next_field().await.map_err(malformed)? {
         let name = field.name().unwrap_or_default().to_string();
         match name.as_str() {
             "file" => {
                 filename = field.file_name().map(str::to_string);
-                let bytes = field.bytes().await.map_err(|e| {
-                    ApiError::invalid_request(
-                        format!("The audio file could not be read: {e}"),
-                        Some("file"),
-                    )
-                })?;
+                let bytes = field.bytes().await.map_err(malformed)?;
                 if bytes.len() > MAX_UPLOAD_BYTES {
-                    return Err(ApiError::invalid_request(
-                        format!(
-                            "The audio file is {} bytes, over the {MAX_UPLOAD_BYTES} byte limit.",
-                            bytes.len()
-                        ),
-                        Some("file"),
-                    ));
+                    return Err(ApiError::too_large(format!(
+                        "The audio file is {} bytes, over the {MAX_UPLOAD_BYTES} byte limit.",
+                        bytes.len()
+                    )));
                 }
                 file = Some(bytes.to_vec());
             }
@@ -144,6 +141,21 @@ pub async fn parse(mut form: Multipart) -> Result<TranscriptionRequest, ApiError
         language,
         format,
     })
+}
+
+/// A multipart failure, with the status the error itself reports.
+///
+/// Body-too-large arrives here rather than as a size check of our own, since
+/// the limit is enforced while the body is still being read. Reporting it as a
+/// malformed request would send a caller looking for a fault in their encoding
+/// rather than at the size of their file.
+fn malformed(e: axum_extra::extract::multipart::MultipartError) -> ApiError {
+    if e.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+        return ApiError::too_large(format!(
+            "The upload is over the {MAX_UPLOAD_BYTES} byte limit."
+        ));
+    }
+    ApiError::invalid_request(format!("The upload is malformed: {e}"), None)
 }
 
 async fn text(field: axum_extra::extract::multipart::Field) -> Result<String, ApiError> {

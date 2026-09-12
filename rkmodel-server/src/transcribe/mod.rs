@@ -173,11 +173,16 @@ fn map_response(response: Response) -> Result<Option<Event>, Error> {
             end_s: end,
         }))),
         // Whisper reports no token counts, so usage stays zero rather than
-        // carrying a number this daemon made up.
-        Response::Done { .. } => Ok(Some(Event::Done {
-            finish: FinishReason::Stop,
-            usage: Usage::default(),
-        })),
+        // carrying a number this daemon made up. rkwhisperd's own timing is
+        // logged instead: it is the first thing to look at when a transcription
+        // feels slow, and an `rtf` over 1 means slower than real time.
+        Response::Done { audio_s, rtf } => {
+            tracing::debug!(audio_s, rtf, "rkwhisperd finished a transcription");
+            Ok(Some(Event::Done {
+                finish: FinishReason::Stop,
+                usage: Usage::default(),
+            }))
+        }
         Response::BackOff { retry_after_ms, .. } => Err(Error::Busy { retry_after_ms }),
         Response::Error { error } => Err(Error::Runtime {
             call: format!("rkwhisperd: {error}"),

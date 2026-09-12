@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header;
 use axum::http::Request;
 use axum::http::StatusCode;
@@ -41,7 +41,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses_endpoint))
-        .route("/v1/audio/transcriptions", post(transcriptions))
+        // Axum's default body limit is 2 MB, well under the upload limit this
+        // endpoint documents, so it is raised for this route alone.
+        .route(
+            "/v1/audio/transcriptions",
+            post(transcriptions).layer(DefaultBodyLimit::max(audio::MAX_BODY_BYTES)),
+        )
         .route("/v1/embeddings", post(not_yet))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1934,6 +1939,61 @@ mod tests {
             h.daemon.heard.lock().unwrap().is_empty(),
             "nothing should have reached the daemon"
         );
+    }
+
+    #[tokio::test]
+    async fn an_upload_larger_than_axums_own_default_still_goes_through() {
+        // Axum's default body limit is 2 MB. This endpoint documents 25, so a
+        // 3 MB upload has to reach the decoder rather than being refused while
+        // the body is still being read.
+        let big = crate::audio::wav(16_000, 1, &crate::audio::sine(16_000, 440.0, 100.0));
+        assert!(
+            big.len() > 3 * 1024 * 1024,
+            "the fixture is {} bytes",
+            big.len()
+        );
+
+        let mut h = harness(transcribing());
+        let (status, body, _) = h
+            .post_form(&[("model", "whisper-small-30s")], Some(("a.wav", &big)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_upload_over_the_limit_is_refused_as_too_large() {
+        // Built past MAX_BODY_BYTES, so the limit fires while the body is being
+        // read rather than in the size check after it.
+        let huge = vec![0u8; crate::audio::MAX_BODY_BYTES + 1];
+        let mut h = harness(transcribing());
+        let (status, body, _) = h
+            .post_form(&[("model", "whisper-small-30s")], Some(("a.wav", &huge)))
+            .await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("limit"),
+            "the message should say it is a size problem, got {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_field_over_the_file_limit_is_refused_as_too_large() {
+        // Between the two limits: the body is readable, the file is not
+        // acceptable. This is the case that names the actual size.
+        let over = vec![0u8; crate::audio::MAX_UPLOAD_BYTES + 1];
+        let mut h = harness(transcribing());
+        let (status, body, _) = h
+            .post_form(&[("model", "whisper-small-30s")], Some(("a.wav", &over)))
+            .await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["error"]["param"], "file");
     }
 
     #[tokio::test]

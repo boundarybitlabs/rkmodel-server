@@ -32,6 +32,21 @@ impl ApiError {
         }
     }
 
+    /// An upload refused on size. OpenAI answers 413 for this, and SDKs map
+    /// that to their own error rather than the generic 400.
+    pub fn too_large(message: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            body: json!({"error": {
+                "message": message.into(),
+                "type": "invalid_request_error",
+                "param": "file",
+                "code": null,
+            }}),
+            retry_after_ms: None,
+        }
+    }
+
     pub fn not_implemented(message: impl Into<String>) -> ApiError {
         ApiError {
             status: StatusCode::NOT_IMPLEMENTED,
