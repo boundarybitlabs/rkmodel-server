@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use crate::config::Sampling;
 use crate::generate::reasoning::{Piece, ReasoningParser};
 
-pub use backend::Backend;
+pub use backend::{Backend, Prompt};
 
 /// What a client is told to wait before retrying a full queue. The daemon
 /// cannot know how long the run in front will take, so this is a floor that
@@ -36,7 +36,7 @@ const EVENT_BUFFER: usize = 64;
 
 struct Job {
     id: u64,
-    prompt: String,
+    prompt: Prompt,
     sampling: Option<Sampling>,
     max_new_tokens: Option<u32>,
     parser: ReasoningParser,
@@ -135,7 +135,7 @@ impl Worker {
     /// Answers `Busy` rather than blocking when the queue is full.
     pub fn submit(
         &self,
-        prompt: String,
+        prompt: Prompt,
         sampling: Option<Sampling>,
         max_new_tokens: Option<u32>,
         parser: ReasoningParser,

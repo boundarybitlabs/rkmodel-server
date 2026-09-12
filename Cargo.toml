@@ -39,6 +39,10 @@ toml = "0.8"
 # preserve_order keeps a map's keys in the order they were written, which is
 # what Python's dict does and what a template's `tojson` must reproduce.
 minijinja = { version = "2", features = ["loader", "builtins", "preserve_order"] }
+# Plan B: prompts tokenized in the daemon, for models whose runtime tokenizer
+# disagrees with Hugging Face's. Without defaults, which pull in oniguruma and a
+# C++ suffix array, so the daemon still cross-compiles with nothing but Rust.
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 thiserror = "2"
 anyhow = "1"

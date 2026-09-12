@@ -1305,16 +1305,19 @@ adapters, and it adds no hardware path.
       of `Message` and `GenerateInput`, `Event::ToolCall`,
       `FinishReason::ToolCalls`, `ModelInfo::tools`, and a new minor
       `protocol_version`
-- [ ] Template environment: a Python-compatible `tojson`, `raise_exception`,
-      `bos_token`, and `tools`, `tool_calls`, `tool_call_id` and
-      `reasoning_content` in the context
+- [x] Template environment: a Python-compatible `tojson`, `raise_exception`,
+      and `bos_token` and `eos_token` from `tokenizer_config.json`
+- [ ] `tools`, `tool_calls`, `tool_call_id` and `reasoning_content` in the
+      template context
   - [ ] The real Qwen3 and Gemma 4 templates render a tool round trip byte for
         byte as `transformers` does
-- [ ] Load with `skip_special_token(false)`, dropping end-of-turn tokens by
-      id, which also fixes Gemma's reasoning split
+- [x] Load with `skip_special_token(false)`, dropping end-of-turn tokens,
+      which also fixes Gemma's reasoning split
 - [ ] `tool_format` in config, checked at load
-- [ ] Plan B for models with `tokenizer` set, which Gemma 4 needs to call
-      tools, or to answer well at all
+- [x] Plan B for models with `tokenizer` set, which Gemma 4 needs to call
+      tools, or to answer well at all. The `tokenizers` crate, built without
+      its C and C++ dependencies, matches Hugging Face's Python tokenizer id
+      for id on eight Gemma prompts.
 - [ ] The `hermes` parser
 - [ ] The `gemma4` parser, including its argument syntax and stopping at
       `<|tool_response>`

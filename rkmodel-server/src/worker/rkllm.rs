@@ -11,7 +11,7 @@ use rkllm::{CallState, Control, InferParams, Input, Param, RkllmSession, Session
 use rkmodel_server_protocol::Error;
 
 use crate::config::{ModelConfig, Sampling};
-use crate::worker::backend::{Backend, Flow, Piece, RunStats};
+use crate::worker::backend::{Backend, Flow, Piece, Prompt, RunStats};
 
 pub struct RkllmBackend {
     session: RkllmSession<RkllmRuntime>,
@@ -43,8 +43,8 @@ fn prefill_tokens(last: Option<&(String, u32)>, prompt: &str, reported: u32) -> 
 
 /// The runtime's own turn framing is switched off, so the prompt text reaches
 /// the model exactly as the daemon rendered it from the model's chat template.
-/// This is Plan A in the design. If it turns out the runtime frames anyway, the
-/// fallback is tokenizing in the daemon and passing `Input::tokens`.
+/// This is Plan A in the design. A model the daemon tokenizes itself, Plan B,
+/// passes `Input::tokens` instead, and the template setting is moot for it.
 const NO_RUNTIME_TEMPLATE: (&str, &str, &str) = ("", "", "");
 
 impl RkllmBackend {
@@ -146,15 +146,20 @@ fn to_rkllm_sampling(s: Sampling) -> rkllm::Sampling {
 impl Backend for RkllmBackend {
     fn run(
         &self,
-        prompt: &str,
+        prompt: &Prompt,
         sampling: Option<Sampling>,
         max_new_tokens: Option<u32>,
         on_piece: &mut dyn FnMut(Piece<'_>) -> Flow,
     ) -> Result<RunStats, Error> {
-        let mut input = Input::prompt(prompt.as_bytes().to_vec()).map_err(|e| Error::Runtime {
-            call: format!("Input::prompt: {e}"),
-            code: -1,
-        })?;
+        let mut input = match &prompt.tokens {
+            // The runtime's own tokenizer splits some models' prompts
+            // differently from Hugging Face's, and Gemma 4 behaves worse for it.
+            Some(tokens) => Input::tokens(tokens.clone()),
+            None => Input::prompt(prompt.text.as_bytes().to_vec()).map_err(|e| Error::Runtime {
+                call: format!("Input::prompt: {e}"),
+                code: -1,
+            })?,
+        };
 
         // The OpenAI APIs are stateless, so every run renders the whole
         // transcript and the runtime's own history is never used.
@@ -222,9 +227,9 @@ impl Backend for RkllmBackend {
         }
 
         let mut last = self.last_prefill.lock().expect("prefill lock");
-        stats.prefill_tokens = prefill_tokens(last.as_ref(), prompt, stats.prefill_tokens);
+        stats.prefill_tokens = prefill_tokens(last.as_ref(), &prompt.text, stats.prefill_tokens);
         if stats.prefill_tokens > 0 {
-            *last = Some((prompt.to_string(), stats.prefill_tokens));
+            *last = Some((prompt.text.clone(), stats.prefill_tokens));
         }
         drop(last);
 

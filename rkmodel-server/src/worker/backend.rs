@@ -17,6 +17,29 @@ pub enum Flow {
     Stop,
 }
 
+/// What a run is given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prompt {
+    /// The rendered prompt. Always present, since the reasoning parser and the
+    /// repeated-prompt accounting both read it.
+    pub text: String,
+    /// The prompt as token ids, for a model the daemon tokenizes itself. The
+    /// runtime is then handed these rather than the text.
+    pub tokens: Option<Vec<i32>>,
+}
+
+impl From<String> for Prompt {
+    fn from(text: String) -> Prompt {
+        Prompt { text, tokens: None }
+    }
+}
+
+impl From<&str> for Prompt {
+    fn from(text: &str) -> Prompt {
+        Prompt::from(text.to_string())
+    }
+}
+
 /// One callback's worth of output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Piece<'a> {
@@ -39,7 +62,7 @@ pub trait Backend: Send + Sync {
     /// Blocking. The worker calls this on its own dedicated thread.
     fn run(
         &self,
-        prompt: &str,
+        prompt: &Prompt,
         sampling: Option<Sampling>,
         max_new_tokens: Option<u32>,
         on_piece: &mut dyn FnMut(Piece<'_>) -> Flow,
@@ -105,13 +128,13 @@ pub mod fake {
     impl Backend for FakeBackend {
         fn run(
             &self,
-            prompt: &str,
+            prompt: &Prompt,
             _sampling: Option<Sampling>,
             max_new_tokens: Option<u32>,
             on_piece: &mut dyn FnMut(Piece<'_>) -> Flow,
         ) -> Result<RunStats, Error> {
             self.runs.fetch_add(1, Ordering::SeqCst);
-            self.seen.lock().unwrap().push(prompt.to_string());
+            self.seen.lock().unwrap().push(prompt.text.clone());
             if let Some(e) = &self.fail_with {
                 return Err(e.clone());
             }

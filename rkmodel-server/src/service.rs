@@ -71,6 +71,7 @@ impl Service {
 
         let parser = loaded.model.parser(&prompt, reasoning_on);
         let budgets = sampling::resolve(loaded.model.sampling, loaded.model.max_new_tokens, &input);
+        let prompt = loaded.model.prompt(prompt, budgets.max_new_tokens)?;
 
         loaded
             .worker
@@ -378,6 +379,7 @@ mod tests {
                         sampling: Default::default(),
                         max_context_len: None,
                         max_new_tokens: None,
+                        tokenizer: None,
                     },
                     worker: {
                         let backend = Arc::new(FakeBackend::new(&["the sky ", "is blue"]));

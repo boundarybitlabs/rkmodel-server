@@ -41,6 +41,11 @@ operations = ["generate"]
 backend = "rkllm"
 rkllm = "/models/gemma-4-e2b/gemma-4-E2B-it-w8a8-16k-rk3588.rkllm"
 chat_template = "/models/gemma-4-e2b/chat_template.jinja"
+# The runtime's own tokenizer splits Gemma's prompts differently from Hugging
+# Face's, and Gemma answers worse for it, so the daemon tokenizes them itself.
+tokenizer = "/models/gemma-4-e2b/tokenizer.json"
+# Gemma's markers are special tokens, which the daemon keeps in the output.
+reasoning = { start = "<|channel>thought\n", end = "<channel|>", default = false }
 max_context_len = 16384
 # The toolkit leaves both embedding tables at fp16 while quantizing the layers
 # to w8a8, so this file is 8 GB of which 5.5 GB is embeddings. Reading them from

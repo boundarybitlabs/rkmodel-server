@@ -16,8 +16,11 @@ pub mod template;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use rkmodel_server_protocol::Error;
+use tokenizers::Tokenizer;
 
 use crate::config::{ModelConfig, Sampling};
+use crate::worker::Prompt;
 use template::ChatTemplate;
 
 /// Everything a `generate` model needs that is not the weights.
@@ -31,6 +34,12 @@ pub struct GenerateModel {
     pub sampling: Sampling,
     pub max_context_len: Option<u32>,
     pub max_new_tokens: Option<u32>,
+    /// Set for a model the daemon tokenizes itself, which is Plan B.
+    ///
+    /// Measured on the board, the runtime's own tokenizer split a Gemma 4 E2B
+    /// tool prompt into 99 tokens where Hugging Face's makes 92, and Gemma only
+    /// called the tool when given the 92.
+    pub tokenizer: Option<Tokenizer>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,13 +62,27 @@ impl GenerateModel {
         let mut template = ChatTemplate::load(path)?;
 
         // A template shipped as bare Jinja carries no token list, so the
-        // special tokens come from a `tokenizer.json` beside it when there is
-        // one.
-        if let Some(tokenizer) = sibling_tokenizer(path) {
-            let extra = template::special_from_tokenizer_json(&tokenizer)
+        // special tokens come from the model's `tokenizer.json`: the configured
+        // one, or one beside the template.
+        let tokenizer_path = model.tokenizer.clone().or_else(|| sibling_tokenizer(path));
+        if let Some(tokenizer) = &tokenizer_path {
+            let extra = template::special_from_tokenizer_json(tokenizer)
                 .with_context(|| format!("reading special tokens for model {}", model.id))?;
             template.add_special_tokens(extra);
         }
+
+        // Only a configured tokenizer switches to Plan B. One that merely sits
+        // beside the template is read for its special tokens and nothing else.
+        let tokenizer = match &model.tokenizer {
+            Some(path) => Some(Tokenizer::from_file(path).map_err(|e| {
+                anyhow::anyhow!(
+                    "loading tokenizer {} for model {}: {e}",
+                    path.display(),
+                    model.id
+                )
+            })?),
+            None => None,
+        };
 
         Ok(GenerateModel {
             template,
@@ -71,6 +94,40 @@ impl GenerateModel {
             sampling: model.sampling,
             max_context_len: model.max_context_len,
             max_new_tokens: model.max_new_tokens,
+            tokenizer,
+        })
+    }
+
+    /// What the backend runs for a rendered prompt: the text alone under
+    /// Plan A, or with its token ids under Plan B.
+    ///
+    /// Only Plan B knows the prompt's length before the run, so only it refuses
+    /// a prompt that does not fit, rather than leaving that to the runtime.
+    pub fn prompt(&self, text: String, max_new_tokens: Option<u32>) -> Result<Prompt, Error> {
+        let Some(tokenizer) = &self.tokenizer else {
+            return Ok(Prompt::from(text));
+        };
+        // No special tokens added: the template writes `bos_token` itself, and
+        // adding another would give the model two.
+        let encoding = tokenizer
+            .encode(text.as_str(), false)
+            .map_err(|e| Error::InvalidInput(format!("tokenizing the prompt failed: {e}")))?;
+        let tokens: Vec<i32> = encoding
+            .get_ids()
+            .iter()
+            .map(|&id| {
+                i32::try_from(id).map_err(|_| {
+                    Error::InvalidInput(format!("token id {id} does not fit the runtime's i32"))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        let length = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+        sampling::check_context_length(length, self.max_context_len, max_new_tokens)?;
+
+        Ok(Prompt {
+            text,
+            tokens: Some(tokens),
         })
     }
 
@@ -144,6 +201,92 @@ default = false"#,
         .unwrap()
     }
 
+    /// A word-level tokenizer with `<bos>` as an added special token, and a
+    /// post-processor that would prepend a second `<bos>` if asked to add
+    /// special tokens.
+    fn tiny_tokenizer() -> Tokenizer {
+        r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [{"id": 0, "content": "<bos>", "single_word": false,
+                "lstrip": false, "rstrip": false, "normalized": false, "special": true}],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": {"type": "TemplateProcessing",
+                "single": [{"SpecialToken": {"id": "<bos>", "type_id": 0}},
+                           {"Sequence": {"id": "A", "type_id": 0}}],
+                "pair": [{"Sequence": {"id": "A", "type_id": 0}},
+                         {"Sequence": {"id": "B", "type_id": 1}}],
+                "special_tokens": {"<bos>": {"id": "<bos>", "ids": [0], "tokens": ["<bos>"]}}},
+            "decoder": null,
+            "model": {"type": "WordLevel",
+                "vocab": {"<bos>": 0, "<unk>": 1, "hello": 2, "world": 3},
+                "unk_token": "<unk>"}
+        }"#
+        .parse()
+        .unwrap()
+    }
+
+    fn plan_b(max_context_len: Option<u32>) -> GenerateModel {
+        GenerateModel {
+            template: ChatTemplate::from_source("x".into(), Default::default()).unwrap(),
+            reasoning: None,
+            sampling: Sampling::default(),
+            max_context_len,
+            max_new_tokens: None,
+            tokenizer: Some(tiny_tokenizer()),
+        }
+    }
+
+    #[test]
+    fn plan_a_hands_over_the_text_alone() {
+        let mut m = plan_b(None);
+        m.tokenizer = None;
+        let prompt = m.prompt("<bos>hello".into(), None).unwrap();
+        assert_eq!(prompt, Prompt::from("<bos>hello"));
+    }
+
+    #[test]
+    fn plan_b_tokenizes_the_rendered_bos_once() {
+        // The template wrote `<bos>`. The tokenizer's own post-processor would
+        // add another, which is why special tokens are not added.
+        let prompt = plan_b(None)
+            .prompt("<bos>hello world".into(), None)
+            .unwrap();
+        assert_eq!(prompt.text, "<bos>hello world");
+        assert_eq!(prompt.tokens, Some(vec![0, 2, 3]));
+    }
+
+    #[test]
+    fn plan_b_refuses_a_prompt_that_does_not_fit() {
+        let err = plan_b(Some(3))
+            .prompt("<bos>hello world".into(), None)
+            .unwrap_err();
+        assert!(matches!(err, Error::ContextLengthExceeded(_)), "{err:?}");
+        let err = plan_b(Some(8))
+            .prompt("<bos>hello world".into(), Some(6))
+            .unwrap_err();
+        assert!(matches!(err, Error::ContextLengthExceeded(_)), "{err:?}");
+        assert!(plan_b(Some(8))
+            .prompt("<bos>hello world".into(), Some(5))
+            .is_ok());
+    }
+
+    #[test]
+    fn a_missing_tokenizer_fails_to_load_with_a_reason() {
+        let dir = std::env::temp_dir().join(format!("rkmodel-generate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let template = dir.join("chat_template.jinja");
+        std::fs::write(&template, "{{ messages[0].content }}").unwrap();
+
+        let mut config = model_config(template.to_str(), None);
+        config.tokenizer = Some(dir.join("tokenizer.json"));
+        let err = load_err(&config);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(format!("{err:#}").contains("tokenizer.json"), "{err:#}");
+    }
+
     #[test]
     fn a_model_with_no_template_fails_to_load_with_a_reason() {
         let err = load_err(&model_config(None, None));
@@ -164,6 +307,7 @@ default = false"#,
             sampling: Sampling::default(),
             max_context_len: None,
             max_new_tokens: None,
+            tokenizer: None,
         };
         assert!(!m.wants_reasoning(None));
         // A client asking a non-reasoning model to reason is a hint, not an
@@ -186,6 +330,7 @@ default = false"#,
             sampling: Sampling::default(),
             max_context_len: None,
             max_new_tokens: None,
+            tokenizer: None,
         };
         assert!(m.wants_reasoning(None), "absent takes the model's default");
         assert!(!m.wants_reasoning(Some(false)));
@@ -204,6 +349,7 @@ default = false"#,
             sampling: Sampling::default(),
             max_context_len: None,
             max_new_tokens: None,
+            tokenizer: None,
         };
         assert!(m
             .parser("<|im_start|>assistant\n<think>\n", true)
