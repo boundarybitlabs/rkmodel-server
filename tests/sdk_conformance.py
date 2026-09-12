@@ -9,6 +9,10 @@ idea of it.
 
 BASE_URL defaults to a frontend on localhost. Point it at a board, or at an ssh
 tunnel to one.
+
+Transcription is checked against RKMODEL_WHISPER_MODEL, which defaults to
+whisper-small-30s. Set it to an empty string to skip those checks where no
+rkwhisperd is running.
 """
 import os
 import sys
@@ -21,6 +25,9 @@ BASE_URL = sys.argv[1] if len(sys.argv) > 1 else os.environ.get(
 MODEL = sys.argv[2] if len(sys.argv) > 2 else os.environ.get(
     "RKMODEL_MODEL", "minicpm4-0.5b"
 )
+# Transcription is a different model on a different daemon, so it is named
+# separately. Set it to "" to skip those checks on a host with no rkwhisperd.
+WHISPER = os.environ.get("RKMODEL_WHISPER_MODEL", "whisper-small-30s")
 
 client = openai.OpenAI(base_url=BASE_URL, api_key=os.environ.get("RKMODEL_API_KEY", "unused"))
 print(f"testing {BASE_URL} with model {MODEL}\n")
@@ -239,6 +246,78 @@ except openai.BadRequestError as e:
     check("n=2 raises BadRequestError", True, e.body.get("param"))
 except Exception as e:
     check("n=2 raises BadRequestError", False, type(e).__name__)
+
+
+# ---- transcription ---------------------------------------------------------
+
+def wav(rate, seconds, hz=440.0):
+    """A RIFF/WAVE sine, so this script needs no audio file beside it."""
+    import math
+    import struct
+
+    frames = int(rate * seconds)
+    samples = b"".join(
+        struct.pack("<h", int(math.sin(i / rate * hz * math.tau) * 0.3 * 32767))
+        for i in range(frames)
+    )
+    header = b"RIFF" + struct.pack("<I", 36 + len(samples)) + b"WAVEfmt "
+    header += struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
+    header += b"data" + struct.pack("<I", len(samples))
+    return header + samples
+
+
+if WHISPER:
+    print()
+    check("models.list returns the transcription model",
+          any(m.id == WHISPER for m in models.data), [m.id for m in models.data])
+
+    # A tone transcribes to nothing much, which is fine: these check the shape
+    # of the response and the SDK's parsing of it, not what whisper heard.
+    t = client.audio.transcriptions.create(
+        model=WHISPER, file=("tone.wav", wav(16_000, 2.0)),
+    )
+    check("a transcription parses into a typed object", hasattr(t, "text"), type(t).__name__)
+
+    t = client.audio.transcriptions.create(
+        model=WHISPER, file=("tone.wav", wav(16_000, 2.0)), response_format="text",
+    )
+    check("response_format=text returns a plain string", isinstance(t, str), repr(t)[:60])
+
+    # The one the SDK's parsing is most worth checking: verbose_json declares
+    # every per-segment field as required, so a missing one raises here.
+    v = client.audio.transcriptions.create(
+        model=WHISPER, file=("tone.wav", wav(16_000, 2.0)), response_format="verbose_json",
+    )
+    check("verbose_json parses into TranscriptionVerbose", v.task == "transcribe", v.task)
+    check("it reports the clip's duration", abs(float(v.duration) - 2.0) < 0.1, v.duration)
+
+    # 44.1 kHz is the rate a real upload usually arrives at, and the one that
+    # exercises the resampler rather than passing straight through.
+    v = client.audio.transcriptions.create(
+        model=WHISPER, file=("tone.wav", wav(44_100, 2.0)), response_format="verbose_json",
+    )
+    check("a 44.1 kHz upload is resampled and still two seconds",
+          abs(float(v.duration) - 2.0) < 0.1, v.duration)
+
+    for fmt, opening in (("srt", "1\n"), ("vtt", "WEBVTT")):
+        body = client.audio.transcriptions.create(
+            model=WHISPER, file=("tone.wav", wav(16_000, 2.0)), response_format=fmt,
+        )
+        # Silence can transcribe to no segments at all, in which case srt is
+        # empty and vtt is just its header. Both are well formed.
+        ok = body.startswith(opening) or (fmt == "srt" and body == "") or (
+            fmt == "vtt" and body.strip() == "WEBVTT")
+        check(f"response_format={fmt} is well formed", ok, repr(body)[:60])
+
+    try:
+        client.audio.transcriptions.create(
+            model=WHISPER, file=("not-audio.wav", b"this is not audio at all"),
+        )
+        check("an upload that is not audio raises BadRequestError", False, "no exception")
+    except openai.BadRequestError as e:
+        check("an upload that is not audio raises BadRequestError", True, e.body.get("param"))
+    except Exception as e:
+        check("an upload that is not audio raises BadRequestError", False, type(e).__name__)
 
 print()
 if failures:

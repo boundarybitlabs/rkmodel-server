@@ -830,9 +830,16 @@ rkwhisperd, forwards the audio, and turns rkwhisperd's responses into events:
 | rkwhisperd | Event or error |
 | --- | --- |
 | `Segment` | `Event::Segment` |
-| `Done` | `Event::Done` |
+| `Done` | `Event::Done`, with no token counts, since whisper reports none |
 | `BackOff` | `Busy`, with its `retry_after_ms` |
 | `Error` | `Runtime` |
+| `Cancelled` | Ends the stream. The daemon is what asked for it, by dropping the session |
+| `SpeechStarted`, `SpeechEnded` | Nothing. The VAD boundaries have no counterpart here |
+
+The last three were not in this table when it was written. `rkwhisper-client`
+turns `Error` into its own `Daemon` and `Cancelled` into `Cancelled` before
+either reaches the daemon, so both are mapped where the client's errors are
+rather than beside the other responses.
 
 Transcription goes through the daemon rather than straight from the frontend to
 rkwhisperd. `rkwhisper-client` needs rkwhisperd's Unix socket and shared-memory
@@ -848,6 +855,18 @@ rkwhisperd serves `whisper-tiny-30s`, `whisper-base-30s` and `whisper-small-30s`
 | `language` | rkwhisper's `lang`. When unset, rkwhisper's default, `en`. |
 | `response_format` | `json` and `text` first. `verbose_json`, `srt` and `vtt` follow from `Segment` start and end times. |
 | `prompt`, `temperature` | Ignored. rkwhisper has no prompt input and decodes with beam search. |
+
+The frontend decodes with `symphonia` and resamples with `rubato`, both pure
+Rust, so the frontend still cross-compiles and still needs nothing on the build
+host. That covers every container on OpenAI's list except webm/opus, which is
+refused: symphonia has no Opus decoder. `duration` is counted from the samples
+the decoder produced rather than read from the upload's header, which may be
+absent, wrong, or describe a length the file does not contain.
+
+`verbose_json` carries the per-segment fields the official SDK declares as
+required. rkwhisper reports no confidences, so `avg_logprob`,
+`compression_ratio` and `no_speech_prob` are zeros standing in for numbers that
+do not exist, and `tokens` is empty.
 
 rkwhisperd sends segments as it decodes them, so OpenAI's `stream=true` for
 transcriptions could be added later over the same events.
@@ -907,8 +926,27 @@ Done. Verified against Qwen3-0.6B and MiniCPM4-0.5B on an RK3588 board.
 
 ### 2. Transcription
 
-`rkwhisper-client` in the daemon, `/v1/audio/transcriptions` in the frontend.
-This comes second because the model code already exists in rkwhisper.
+Written, and passing against a fake daemon. Nothing here has run against a
+board yet.
+
+- [x] `rkwhisper-client` in the daemon, behind an `Asr` trait that is to this
+      what `Backend` is to generate. The session driver and the response
+      mapping are tested without a socket.
+- [x] `POST /v1/audio/transcriptions`
+  - [x] Multipart upload, with OpenAI's 25 MB limit
+  - [x] Decoded and resampled to 16 kHz mono s16le, streamed to the daemon as
+        it goes rather than buffered whole
+  - [x] `json` and `text`
+  - [x] `verbose_json`, `srt` and `vtt` from segment start and end times
+  - [x] `language`; `prompt` and `temperature` accepted and ignored
+- [x] rkwhisper models report `ready` or `unavailable` from a probe, since
+      nothing loads them here. See [Open questions](#open-questions).
+- [x] The official SDK covers transcription in `tests/sdk_conformance.py`,
+      including `verbose_json`, whose per-segment fields the SDK requires.
+- [ ] Run against rkwhisperd on the board, with a real recording.
+- [ ] Client disconnect stops a transcription in rkwhisperd, measured the way
+      generate's was.
+- [ ] `stream: true`, which rkwhisperd's segments already support.
 
 ### 3. Images
 
@@ -954,7 +992,12 @@ which the server had written nothing.
 7. An RKLLM run and an RKNN run can execute at the same time in one process.
    `examples/qwen2-vl` loads both but runs them one after the other.
 8. Chat latency while rkwhisperd holds all three NPU cores.
-9. How to tell whether rkwhisperd is up without starting a transcription
+9. How to tell whether rkwhisperd is up without starting a transcription.
+   Answered for now by opening a session and dropping it, every 30 seconds:
+   the handshake names the model, so it catches a model rkwhisperd does not
+   serve, and no audio follows, so rkwhisperd does no NPU work for it. Whether
+   that is cheap enough to keep, and whether the interval belongs in config,
+   is still open
    session, for `unavailable`.
 
 ## Changes to other crates
