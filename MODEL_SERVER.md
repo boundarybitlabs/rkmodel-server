@@ -748,6 +748,10 @@ never taken for a call.
   run there with `Flow::Stop`.
 - With `parallel_tool_calls: false`, the parser stops the run after the first
   call.
+- A stopped run loses its perf stats, board check 16, so a stop only stops a
+  Plan B run, whose prompt length the daemon knows. A Plan A run carries on to
+  its natural end with its output dropped, and its usage counts what it
+  generated.
 
 #### Choosing a call
 
@@ -1354,7 +1358,7 @@ is templates, parsers and adapters, and it adds no hardware path.
 - [x] On the board: a tool loop on Qwen3 and on Gemma 4 E2B, through the
       official SDK on both endpoints. See board check 14 for what each model
       needs to answer from a result.
-- [ ] Board check 16, whether a run stopped from a callback gets its perf stats
+- [x] Board check 16, whether a run stopped from a callback gets its perf stats
 
 ### 4. Images
 
@@ -1440,10 +1444,12 @@ which the server had written nothing.
       and on for the answer.
 15. Which tokens the runtime's tokenizer splits differently for Gemma. Plan B
     makes it moot for text, but it matters for images, which need text.
-16. Whether a run stopped from inside a callback, which the tool parser does
-    after a call, still gets a final callback with its perf stats. If not,
-    Plan B falls back to its own prompt length, and Plan A reports zero input
-    tokens for that run.
+16. **Answered: no.** A run stopped from inside a callback gets no perf stats. A
+    Qwen3 run stopped after its first call, with `parallel_tool_calls: false`,
+    reported 0 input tokens. So a run the parser wants stopped only stops under
+    Plan B, which knows its prompt's length. Under Plan A it runs to its natural
+    end with nothing more forwarded: the same request then reported 175 input
+    tokens, one call, and 39 output tokens, the second call included.
 
 ## Changes to other crates
 

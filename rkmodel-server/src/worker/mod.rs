@@ -187,7 +187,13 @@ fn run_job(inner: &Arc<Inner>, mut job: Job) {
     // below the number of callbacks that actually carried text, which would
     // report a truncated answer as a natural stop. See `generated`.
     let mut text_callbacks = 0u32;
+    // A run the parser wanted stopped, but which keeps going with its output
+    // dropped. See below.
+    let mut draining = false;
+    // Only a prompt the daemon tokenized knows its own length.
+    let knows_prompt_length = job.prompt.tokens.is_some();
     let result = {
+        let draining = &mut draining;
         let events = job.events.clone();
         let cancelled = job.cancelled.clone();
         let parser = &mut job.parser;
@@ -211,6 +217,9 @@ fn run_job(inner: &Arc<Inner>, mut job: Job) {
                 if inner.end_of_turn.iter().any(|t| t == text) {
                     return backend::Flow::Continue;
                 }
+                if *draining {
+                    return backend::Flow::Continue;
+                }
                 *text_callbacks += 1;
                 let (out, stop) = parser.push(text);
                 for event in out {
@@ -221,9 +230,18 @@ fn run_job(inner: &Arc<Inner>, mut job: Job) {
                 }
                 // A parser stops a run that would otherwise go on to invent a
                 // tool's result, or make a second call it was told not to.
-                if stop {
+                //
+                // Measured on the board, a run stopped from a callback gets no
+                // final perf stats, so its prompt length is lost. Under Plan B
+                // the daemon knows it anyway, and stops. Under Plan A the run
+                // goes on to its natural end with nothing more forwarded, which
+                // costs the tokens of a call the client will never see.
+                if !stop {
+                    backend::Flow::Continue
+                } else if knows_prompt_length {
                     backend::Flow::Stop
                 } else {
+                    *draining = true;
                     backend::Flow::Continue
                 }
             },
@@ -314,6 +332,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_run_without_token_ids_drains_rather_than_stops() {
+        let backend = Arc::new(FakeBackend::new(&[
+            "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>",
+            "<|tool_call>call:get_weather{city:<|\"|>London<|\"|>}<tool_call|>",
+            "more",
+        ]));
+        let w = Worker::start("m".into(), backend, 4, Vec::new());
+        let (rx, handle) = w.submit("p".into(), None, None, tool_parser(true)).unwrap();
+        let events = drain(rx).await;
+        drop(handle);
+
+        let calls = events
+            .iter()
+            .filter(|e| matches!(e, Ok(Event::ToolCall(_))))
+            .count();
+        assert_eq!(calls, 1, "{events:?}");
+        let Some(Ok(Event::Done { finish, usage })) = events.last() else {
+            panic!("no final event: {events:?}");
+        };
+        assert_eq!(*finish, FinishReason::ToolCalls);
+        // The run went on to its end, so every token it generated is counted.
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(events.len(), 2, "{events:?}");
+    }
+
+    #[tokio::test]
     async fn a_run_that_calls_a_tool_finishes_tool_calls_and_stops_before_a_result() {
         let backend = Arc::new(FakeBackend::new(&[
             "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>",
@@ -322,9 +366,12 @@ mod tests {
             "<tool_response|>",
         ]));
         let w = Worker::start("m".into(), backend, 4, Vec::new());
-        let (rx, handle) = w
-            .submit("p".into(), None, None, tool_parser(false))
-            .unwrap();
+        // Token ids, as under Plan B, which is what lets the run stop.
+        let prompt = Prompt {
+            text: "p".into(),
+            tokens: Some(vec![1, 2, 3]),
+        };
+        let (rx, handle) = w.submit(prompt, None, None, tool_parser(false)).unwrap();
         let events = drain(rx).await;
         drop(handle);
 
