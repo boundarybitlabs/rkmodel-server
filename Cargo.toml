@@ -38,3 +38,7 @@ clap = { version = "4", features = ["derive", "env"] }
 # at run time. That keeps librkllmrt off the build host, so the daemon
 # cross-compiles for the board from anywhere.
 rkllm = { git = "https://github.com/boundarybitlabs/rkllm-rs", branch = "main" }
+# rkwhisperd owns the whisper models and their queue; the daemon only proxies to
+# it. The client needs rkwhisperd's Unix socket and shared-memory audio ring,
+# which is why transcription goes through the daemon and not the frontend.
+rkwhisper-client = { git = "https://github.com/boundarybitlabs/rkwhisper", branch = "main" }

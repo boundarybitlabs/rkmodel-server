@@ -868,12 +868,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
+ "async-trait",
  "clap",
  "minijinja",
  "minijinja-contrib",
  "prost",
  "rkllm",
  "rkmodel-server-protocol",
+ "rkwhisper-client",
  "serde",
  "serde_json",
  "thiserror",
@@ -931,6 +933,30 @@ dependencies = [
  "thiserror",
  "tonic",
  "tonic-build",
+]
+
+[[package]]
+name = "rkwhisper-client"
+version = "0.1.0"
+source = "git+https://github.com/boundarybitlabs/rkwhisper?branch=main#8fd53c961e4d5d1df514d8dbf59495005dce4da6"
+dependencies = [
+ "anyhow",
+ "rkwhisper-protocol",
+ "rustix",
+ "serde",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "rkwhisper-protocol"
+version = "0.1.0"
+source = "git+https://github.com/boundarybitlabs/rkwhisper?branch=main#8fd53c961e4d5d1df514d8dbf59495005dce4da6"
+dependencies = [
+ "anyhow",
+ "rustix",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
