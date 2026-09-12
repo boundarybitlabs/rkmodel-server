@@ -50,7 +50,11 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-Cross-compiling for an RK3588 board, which needs
+CI runs the same checks on arm64 runners, so the binaries it builds are the ones
+the board runs. It also tests the frontend on x86_64, which is what keeps the
+claim that it needs no hardware true.
+
+Cross-compiling for an RK3588 board from an x86_64 host, which needs
 `gcc-aarch64-linux-gnu` and the `aarch64-unknown-linux-gnu` target:
 
 ```sh
